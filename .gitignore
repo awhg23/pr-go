@@ -1,0 +1,12 @@
+reference(gitignore)
+.DS_Store
+
+# Go
+bin/
+*.exe
+*.test
+*.out
+
+# Env
+.env
+config.yaml
