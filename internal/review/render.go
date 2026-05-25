@@ -3,6 +3,8 @@ package review
 import (
 	"fmt"
 	"strings"
+
+	"github.com/awhg23/pr-go/internal/github"
 )
 
 func RenderMarkdown(input Input, result Result) string {
@@ -42,5 +44,53 @@ func RenderMarkdown(input Input, result Result) string {
 		fmt.Fprintf(&b, "- Reason: %s\n", finding.Reason)
 		fmt.Fprintf(&b, "- Suggestion: %s\n\n", finding.Suggestion)
 	}
+	return b.String()
+}
+
+func RenderGitHubComment(input Input, result Result, checks github.ChecksSummary) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "## PR Approval Agent\n\n")
+	fmt.Fprintf(&b, "**Risk Level:** `%s`  \n", strings.ToUpper(result.Risk.Level))
+	fmt.Fprintf(&b, "**Risk Score:** `%d`  \n", result.Risk.Score)
+	fmt.Fprintf(&b, "**CI/Checks:** `%s`\n\n", checks.State)
+
+	fmt.Fprintf(&b, "### Key Reasons\n\n")
+	for _, reason := range result.Risk.Reasons {
+		fmt.Fprintf(&b, "- %s\n", reason)
+	}
+	if len(checks.Details) > 0 {
+		fmt.Fprintf(&b, "- Check details: %s\n", strings.Join(checks.Details, ", "))
+	}
+
+	fmt.Fprintf(&b, "\n### Summary\n\n%s\n\n", strings.TrimSpace(result.Summary))
+	fmt.Fprintf(&b, "### Findings\n\n")
+	if len(result.Findings) == 0 {
+		fmt.Fprintf(&b, "No structured findings returned.\n\n")
+	} else {
+		for _, finding := range result.Findings {
+			location := finding.FilePath
+			if finding.LineNumber > 0 {
+				location = fmt.Sprintf("%s:%d", finding.FilePath, finding.LineNumber)
+			}
+			fmt.Fprintf(&b, "- **[%s] %s** `%s`\n", strings.ToUpper(finding.Severity), finding.Title, location)
+			fmt.Fprintf(&b, "  - Reason: %s\n", finding.Reason)
+			fmt.Fprintf(&b, "  - Suggestion: %s\n", finding.Suggestion)
+		}
+		fmt.Fprintf(&b, "\n")
+	}
+
+	fmt.Fprintf(&b, "### Next Steps\n\n")
+	switch result.Risk.Level {
+	case "low":
+		fmt.Fprintf(&b, "- Maintainers can continue with normal review.\n")
+	case "medium":
+		fmt.Fprintf(&b, "- Maintainers should review the findings before approval.\n")
+	default:
+		fmt.Fprintf(&b, "- Maintainers should not approve until the blocking/high-risk items are resolved or dismissed by policy.\n")
+	}
+	if checks.State != "success" {
+		fmt.Fprintf(&b, "- Wait for CI/checks to become successful before final approval.\n")
+	}
+	fmt.Fprintf(&b, "- This V1 MVP never approves or merges PRs automatically.\n")
 	return b.String()
 }

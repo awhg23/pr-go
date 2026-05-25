@@ -14,6 +14,7 @@ type Input struct {
 	ChangedFiles   []FileDiff
 	Diff           string
 	DiffTruncated  bool
+	CheckStatus    string
 	OmittedBytes   int
 	MaxDiffBytes   int
 	ChangedCount   int

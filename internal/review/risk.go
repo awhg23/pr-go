@@ -34,6 +34,14 @@ func ScoreRisk(input Input, findings []Finding) Risk {
 		score += 10
 		reasons = append(reasons, "diff was compressed before review")
 	}
+	switch input.CheckStatus {
+	case "failure":
+		score += 20
+		reasons = append(reasons, "CI/check status is failing")
+	case "pending", "unknown":
+		score += 10
+		reasons = append(reasons, "CI/check status is not confirmed")
+	}
 	for _, file := range input.ChangedFiles {
 		if isHighRiskPath(file.Path) {
 			score += 15

@@ -18,3 +18,10 @@ func TestScoreRiskHighRiskPath(t *testing.T) {
 		t.Fatalf("score = %d, want high-risk path adjustment", risk.Score)
 	}
 }
+
+func TestScoreRiskFailedChecks(t *testing.T) {
+	risk := ScoreRisk(Input{CheckStatus: "failure"}, nil)
+	if risk.Score < 30 {
+		t.Fatalf("score = %d, want failed checks adjustment", risk.Score)
+	}
+}

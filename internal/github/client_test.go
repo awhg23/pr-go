@@ -17,3 +17,20 @@ func TestParsePullRequestURLRejectsNonPR(t *testing.T) {
 		t.Fatal("expected invalid URL error")
 	}
 }
+
+func TestSummarizeChecks(t *testing.T) {
+	summary := summarizeChecks("", nil, []struct {
+		Name       string `json:"name"`
+		Status     string `json:"status"`
+		Conclusion string `json:"conclusion"`
+	}{
+		{Name: "test", Status: "completed", Conclusion: "success"},
+		{Name: "lint", Status: "completed", Conclusion: "failure"},
+	})
+	if summary.State != "failure" {
+		t.Fatalf("state = %q, want failure", summary.State)
+	}
+	if len(summary.Details) != 2 {
+		t.Fatalf("details = %v, want two entries", summary.Details)
+	}
+}

@@ -41,6 +41,25 @@ func TestParseWebhookPullRequestTrigger(t *testing.T) {
 	}
 }
 
+func TestPullRequestSynchronizeTrigger(t *testing.T) {
+	event := WebhookEvent{Event: EventPullRequest, Action: "synchronize", PullRequest: &PullRequest{}}
+	if !event.ShouldTriggerReview() {
+		t.Fatal("expected pull_request.synchronize to trigger review")
+	}
+	event.Action = "reopened"
+	if event.ShouldTriggerReview() {
+		t.Fatal("did not expect pull_request.reopened in V1 trigger set")
+	}
+}
+
+func TestRepositoryOwnerRepoFromFullName(t *testing.T) {
+	event := WebhookEvent{Repository: Repository{FullName: "owner/repo"}}
+	owner, repo := event.RepositoryOwnerRepo()
+	if owner != "owner" || repo != "repo" {
+		t.Fatalf("owner/repo = %s/%s, want owner/repo", owner, repo)
+	}
+}
+
 func TestParseWebhookCommand(t *testing.T) {
 	body := []byte(`{"action":"created","issue":{"number":12,"pull_request":{}},"comment":{"body":"/ai-review now","user":{"login":"maintainer"}}}`)
 	headers := http.Header{}
