@@ -44,3 +44,24 @@ go run ./cmd/pr-go --provider mock --output json --pr-url https://github.com/own
 ```bash
 go test ./...
 ```
+
+Run the optional GitHub integration test against a real pull request:
+
+```bash
+PR_GO_INTEGRATION_PR_URL=https://github.com/owner/repo/pull/123 \
+GITHUB_TOKEN=github_pat_xxx \
+go test ./internal/github -run TestFetchPullRequestIntegration
+```
+
+The integration test is skipped unless `PR_GO_INTEGRATION_PR_URL` is set.
+
+## V1 Preparation
+
+This repository also contains an early GitHub App webhook foundation in `internal/app`:
+
+- `VerifySignature` validates `X-Hub-Signature-256` with HMAC SHA-256.
+- `ParseWebhook` extracts pull request and issue comment events.
+- `WebhookEvent.ShouldTriggerReview` identifies PR events that should start review.
+- `WebhookEvent.Command` extracts `/ai-*` commands from PR comments.
+
+Review output carries stable schema metadata through `schema_version`, `prompt_version`, and `model_invocation` fields so V2 persistence can map model calls and review results into MySQL without depending on rendered comments.

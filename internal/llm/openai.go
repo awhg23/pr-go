@@ -88,6 +88,13 @@ func (r *OpenAIReviewer) Review(ctx context.Context, input review.Input) (review
 	if err := json.Unmarshal([]byte(content), &result); err != nil {
 		return review.Result{}, fmt.Errorf("parse structured review JSON: %w", err)
 	}
+	result.ModelInvocation = &review.ModelInvocation{
+		Provider:      "openai-compatible",
+		Model:         r.model,
+		PromptVersion: review.CurrentPromptVersion,
+		Status:        "success",
+	}
+	review.EnsureSchema(&result)
 	normalizeFindings(&result)
 	return result, nil
 }

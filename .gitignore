@@ -9,4 +9,5 @@ bin/
 
 # Env
 .env
+.envrc
 config.yaml

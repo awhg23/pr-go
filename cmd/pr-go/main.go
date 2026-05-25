@@ -60,6 +60,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	review.EnsureSchema(&result)
 	result.Risk = review.ScoreRisk(input, result.Findings)
 
 	switch cfg.Output {

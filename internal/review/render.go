@@ -11,6 +11,7 @@ func RenderMarkdown(input Input, result Result) string {
 	fmt.Fprintf(&b, "- Repository: `%s/%s`\n", input.Owner, input.Repo)
 	fmt.Fprintf(&b, "- Pull Request: #%d `%s`\n", input.Number, input.Title)
 	fmt.Fprintf(&b, "- Author: `%s`\n", input.AuthorLogin)
+	fmt.Fprintf(&b, "- Schema: `%s`, Prompt: `%s`\n", result.SchemaVersion, result.PromptVersion)
 	fmt.Fprintf(&b, "- Files: %d, additions: %d, deletions: %d\n", input.ChangedCount, input.TotalAdditions, input.TotalDeletions)
 	if input.DiffTruncated {
 		fmt.Fprintf(&b, "- Diff: compressed to %d bytes, omitted about %d bytes\n", input.MaxDiffBytes, input.OmittedBytes)

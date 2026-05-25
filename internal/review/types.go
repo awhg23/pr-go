@@ -32,9 +32,12 @@ type FileDiff struct {
 }
 
 type Result struct {
-	Summary  string    `json:"summary"`
-	Findings []Finding `json:"findings"`
-	Risk     Risk      `json:"risk"`
+	SchemaVersion   string           `json:"schema_version"`
+	PromptVersion   string           `json:"prompt_version"`
+	Summary         string           `json:"summary"`
+	Findings        []Finding        `json:"findings"`
+	Risk            Risk             `json:"risk"`
+	ModelInvocation *ModelInvocation `json:"model_invocation,omitempty"`
 }
 
 type Finding struct {

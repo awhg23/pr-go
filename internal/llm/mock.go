@@ -42,5 +42,16 @@ func (MockReviewer) Review(_ context.Context, input review.Input) (review.Result
 	if len(findings) > 0 {
 		summary = fmt.Sprintf("Mock review completed with %d structured finding(s).", len(findings))
 	}
-	return review.Result{Summary: summary, Findings: findings}, nil
+	result := review.Result{
+		Summary:  summary,
+		Findings: findings,
+		ModelInvocation: &review.ModelInvocation{
+			Provider:      "mock",
+			Model:         "heuristic",
+			PromptVersion: review.CurrentPromptVersion,
+			Status:        "success",
+		},
+	}
+	review.EnsureSchema(&result)
+	return result, nil
 }

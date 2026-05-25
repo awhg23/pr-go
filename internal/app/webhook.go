@@ -1,0 +1,127 @@
+package app
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+)
+
+const (
+	EventPullRequest  = "pull_request"
+	EventIssueComment = "issue_comment"
+)
+
+type WebhookEvent struct {
+	Event       string
+	Action      string
+	DeliveryID  string
+	Repository  Repository
+	PullRequest *PullRequest
+	Issue       *Issue
+	Comment     *Comment
+	RawPayload  []byte
+}
+
+type Repository struct {
+	FullName string `json:"full_name"`
+}
+
+type PullRequest struct {
+	Number  int    `json:"number"`
+	HTMLURL string `json:"html_url"`
+	Head    struct {
+		SHA string `json:"sha"`
+	} `json:"head"`
+}
+
+type Issue struct {
+	Number      int  `json:"number"`
+	PullRequest *any `json:"pull_request"`
+}
+
+type Comment struct {
+	Body string `json:"body"`
+	User struct {
+		Login string `json:"login"`
+	} `json:"user"`
+}
+
+func VerifySignature(secret string, body []byte, signatureHeader string) error {
+	if secret == "" {
+		return errors.New("webhook secret is required")
+	}
+	if signatureHeader == "" {
+		return errors.New("missing X-Hub-Signature-256 header")
+	}
+	const prefix = "sha256="
+	if !strings.HasPrefix(signatureHeader, prefix) {
+		return errors.New("unsupported signature header")
+	}
+
+	want, err := hex.DecodeString(strings.TrimPrefix(signatureHeader, prefix))
+	if err != nil {
+		return fmt.Errorf("decode signature: %w", err)
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	got := mac.Sum(nil)
+	if !hmac.Equal(got, want) {
+		return errors.New("invalid webhook signature")
+	}
+	return nil
+}
+
+func ParseWebhook(headers http.Header, body []byte, secret string) (WebhookEvent, error) {
+	if err := VerifySignature(secret, body, headers.Get("X-Hub-Signature-256")); err != nil {
+		return WebhookEvent{}, err
+	}
+
+	var payload struct {
+		Action      string       `json:"action"`
+		Repository  Repository   `json:"repository"`
+		PullRequest *PullRequest `json:"pull_request"`
+		Issue       *Issue       `json:"issue"`
+		Comment     *Comment     `json:"comment"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return WebhookEvent{}, fmt.Errorf("parse webhook payload: %w", err)
+	}
+
+	return WebhookEvent{
+		Event:       headers.Get("X-GitHub-Event"),
+		Action:      payload.Action,
+		DeliveryID:  headers.Get("X-GitHub-Delivery"),
+		Repository:  payload.Repository,
+		PullRequest: payload.PullRequest,
+		Issue:       payload.Issue,
+		Comment:     payload.Comment,
+		RawPayload:  append([]byte(nil), body...),
+	}, nil
+}
+
+func (e WebhookEvent) ShouldTriggerReview() bool {
+	if e.Event != EventPullRequest || e.PullRequest == nil {
+		return false
+	}
+	return e.Action == "opened" || e.Action == "synchronize" || e.Action == "reopened"
+}
+
+func (e WebhookEvent) Command() string {
+	if e.Event != EventIssueComment || e.Issue == nil || e.Issue.PullRequest == nil || e.Comment == nil {
+		return ""
+	}
+	body := strings.TrimSpace(e.Comment.Body)
+	if !strings.HasPrefix(body, "/ai-") {
+		return ""
+	}
+	fields := strings.Fields(body)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
