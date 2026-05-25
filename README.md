@@ -1,6 +1,6 @@
 # pr-go
 
-`pr-go` is a Go prototype for a PR approval agent. V0 validates the local CLI review pipeline, and V1 adds a GitHub App webhook MVP that can review pull requests and publish risk comments.
+`pr-go` is a Go prototype for a PR approval agent. V0 validates the local CLI review pipeline, V1 adds a GitHub App webhook MVP, and V2 adds MySQL-backed review history, audit logs, delivery deduplication, async processing, and retries.
 
 ## V0 Scope
 
@@ -74,6 +74,7 @@ Run the GitHub App webhook server:
 GITHUB_APP_ID=123456 \
 GITHUB_APP_PRIVATE_KEY_FILE=/path/to/private-key.pem \
 GITHUB_WEBHOOK_SECRET=webhook-secret \
+MYSQL_DSN='user:pass@tcp(127.0.0.1:3306)/pr_go?parseTime=true' \
 OPENAI_API_KEY=sk-xxx \
 go run ./cmd/pr-go --server --addr :8080
 ```
@@ -84,6 +85,7 @@ For local smoke testing without an LLM key:
 GITHUB_APP_ID=123456 \
 GITHUB_APP_PRIVATE_KEY_FILE=/path/to/private-key.pem \
 GITHUB_WEBHOOK_SECRET=webhook-secret \
+MYSQL_DSN='user:pass@tcp(127.0.0.1:3306)/pr_go?parseTime=true' \
 go run ./cmd/pr-go --server --provider mock
 ```
 
@@ -96,4 +98,43 @@ GET  /healthz
 
 V1 listens to `pull_request.opened` and `pull_request.synchronize`, fetches PR metadata, changed files, diff patches, and check status with an installation token, then posts a PR comment containing risk level, key reasons, findings, and next steps.
 
-V1 does not approve, merge, persist to MySQL, provide a web console, or support non-GitHub providers.
+V1 did not approve, merge, persist to MySQL, provide a web console, or support non-GitHub providers. V2 adds MySQL persistence while keeping approve/merge and web console out of scope.
+
+## V2 MySQL Persistence
+
+V2 requires MySQL for server mode. The server runs the built-in schema automatically on startup; the same schema is available as `migrations/001_init_mysql.sql`.
+
+Stored data includes:
+
+- GitHub installations and repositories.
+- Pull requests and `approval_status`.
+- Webhook deliveries for delivery-id deduplication.
+- Review runs with success/failure status and error messages.
+- Structured findings.
+- Risk scores and reasons.
+- Model invocation metadata.
+- Review comment publish results.
+- Audit logs for successful reviews and failure paths.
+
+Webhook requests are acknowledged after signature validation, delivery deduplication, and enqueueing. Review execution happens in background workers controlled by `--worker-count`; failed jobs retry with exponential backoff up to `--max-retries`.
+
+Useful server flags:
+
+```text
+--mysql-dsn       MySQL DSN for V2 persistence
+--worker-count    number of async review workers
+--max-retries     maximum async review attempts
+```
+
+Query recent high-risk PRs:
+
+```sql
+SELECT repo.full_name, pr.pr_number, pr.title, rs.score, rs.level, rs.created_at
+FROM risk_scores rs
+JOIN pull_requests pr ON pr.id = rs.pull_request_id
+JOIN repositories repo ON repo.id = pr.repository_id
+WHERE repo.full_name = 'owner/repo'
+  AND rs.level IN ('high', 'blocker')
+ORDER BY rs.created_at DESC
+LIMIT 20;
+```

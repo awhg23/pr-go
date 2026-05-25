@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/awhg23/pr-go/internal/app"
@@ -23,6 +24,9 @@ type config struct {
 	AppID         int64
 	PrivateKey    string
 	WebhookSecret string
+	MySQLDSN      string
+	WorkerCount   int
+	MaxRetries    int
 	Provider      string
 	Output        string
 	MaxDiffBytes  int
@@ -100,8 +104,11 @@ func runServer(cfg config) error {
 		AppID:         cfg.AppID,
 		PrivateKeyPEM: privateKey,
 		Provider:      cfg.Provider,
+		MySQLDSN:      cfg.MySQLDSN,
 		MaxDiffBytes:  cfg.MaxDiffBytes,
 		Timeout:       cfg.Timeout,
+		WorkerCount:   cfg.WorkerCount,
+		MaxRetries:    cfg.MaxRetries,
 	}, nil)
 	if err != nil {
 		return err
@@ -118,6 +125,9 @@ func parseFlags() config {
 	flag.Int64Var(&cfg.AppID, "github-app-id", envInt64Default("GITHUB_APP_ID", 0), "GitHub App ID")
 	flag.StringVar(&cfg.PrivateKey, "github-app-private-key-file", os.Getenv("GITHUB_APP_PRIVATE_KEY_FILE"), "path to GitHub App private key PEM")
 	flag.StringVar(&cfg.WebhookSecret, "webhook-secret", os.Getenv("GITHUB_WEBHOOK_SECRET"), "GitHub webhook secret")
+	flag.StringVar(&cfg.MySQLDSN, "mysql-dsn", os.Getenv("MYSQL_DSN"), "MySQL DSN for V2 persistence")
+	flag.IntVar(&cfg.WorkerCount, "worker-count", envIntDefault("PR_GO_WORKER_COUNT", 2), "number of async review workers")
+	flag.IntVar(&cfg.MaxRetries, "max-retries", envIntDefault("PR_GO_MAX_RETRIES", 3), "maximum async review attempts")
 	flag.StringVar(&cfg.Provider, "provider", envDefault("PR_GO_PROVIDER", "openai"), "review provider: openai or mock")
 	flag.StringVar(&cfg.Output, "output", "markdown", "output format: markdown or json")
 	flag.IntVar(&cfg.MaxDiffBytes, "max-diff-bytes", 60000, "maximum diff bytes sent to the reviewer")
@@ -135,8 +145,16 @@ func envDefault(name, fallback string) string {
 
 func envInt64Default(name string, fallback int64) int64 {
 	if v := os.Getenv(name); v != "" {
-		var parsed int64
-		if _, err := fmt.Sscan(v, &parsed); err == nil {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
+func envIntDefault(name string, fallback int) int {
+	if v := os.Getenv(name); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
 			return parsed
 		}
 	}

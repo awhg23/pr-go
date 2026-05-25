@@ -25,6 +25,7 @@ type WebhookEvent struct {
 	PullRequest  *PullRequest
 	Issue        *Issue
 	Comment      *Comment
+	Sender       Sender
 	RawPayload   []byte
 }
 
@@ -58,6 +59,11 @@ type Comment struct {
 	User struct {
 		Login string `json:"login"`
 	} `json:"user"`
+}
+
+type Sender struct {
+	Login string `json:"login"`
+	Type  string `json:"type"`
 }
 
 func VerifySignature(secret string, body []byte, signatureHeader string) error {
@@ -97,6 +103,7 @@ func ParseWebhook(headers http.Header, body []byte, secret string) (WebhookEvent
 		PullRequest  *PullRequest `json:"pull_request"`
 		Issue        *Issue       `json:"issue"`
 		Comment      *Comment     `json:"comment"`
+		Sender       Sender       `json:"sender"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return WebhookEvent{}, fmt.Errorf("parse webhook payload: %w", err)
@@ -111,6 +118,7 @@ func ParseWebhook(headers http.Header, body []byte, secret string) (WebhookEvent
 		PullRequest:  payload.PullRequest,
 		Issue:        payload.Issue,
 		Comment:      payload.Comment,
+		Sender:       payload.Sender,
 		RawPayload:   append([]byte(nil), body...),
 	}, nil
 }
