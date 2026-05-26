@@ -29,6 +29,7 @@ type config struct {
 	MaxRetries    int
 	QueuePoll     time.Duration
 	AdminToken    string
+	AdminTokens   string
 	AlertWebhook  string
 	Provider      string
 	Output        string
@@ -114,6 +115,7 @@ func runServer(cfg config) error {
 		MaxRetries:    cfg.MaxRetries,
 		QueuePoll:     cfg.QueuePoll,
 		AdminToken:    cfg.AdminToken,
+		AdminTokens:   cfg.AdminTokens,
 		AlertWebhook:  cfg.AlertWebhook,
 	}, nil)
 	if err != nil {
@@ -136,6 +138,7 @@ func parseFlags() config {
 	flag.IntVar(&cfg.MaxRetries, "max-retries", envIntDefault("PR_GO_MAX_RETRIES", 3), "maximum async review attempts")
 	flag.DurationVar(&cfg.QueuePoll, "queue-poll", envDurationDefault("PR_GO_QUEUE_POLL", 2*time.Second), "persistent queue poll interval")
 	flag.StringVar(&cfg.AdminToken, "admin-token", os.Getenv("PR_GO_ADMIN_TOKEN"), "admin dashboard/API bearer token")
+	flag.StringVar(&cfg.AdminTokens, "admin-tokens", os.Getenv("PR_GO_ADMIN_TOKENS"), "semicolon-separated admin tokens: name:token:scope1,scope2")
 	flag.StringVar(&cfg.AlertWebhook, "alert-webhook", os.Getenv("PR_GO_ALERT_WEBHOOK_URL"), "optional alert webhook URL for final job failures")
 	flag.StringVar(&cfg.Provider, "provider", envDefault("PR_GO_PROVIDER", "openai"), "review provider: openai-compatible, openai, deepseek, siliconflow, ollama, or mock")
 	flag.StringVar(&cfg.Output, "output", "markdown", "output format: markdown or json")

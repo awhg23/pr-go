@@ -19,6 +19,8 @@ type Store interface {
 	FailWebhookJob(context.Context, int64, string) error
 	UpsertInstallation(context.Context, Installation) (int64, error)
 	UpsertRepository(context.Context, Repository) (int64, error)
+	DeactivateRepository(context.Context, string) (int64, bool, error)
+	DeactivateRepositoriesByInstallation(context.Context, int64) ([]int64, error)
 	UpsertPullRequest(context.Context, PullRequest) (int64, error)
 	EnsurePullRequest(context.Context, int64, int) (int64, error)
 	UpdatePullRequestApprovalStatus(context.Context, int64, string) error
@@ -170,6 +172,8 @@ type RepositorySummary struct {
 	ID             int64
 	InstallationID int64
 	FullName       string
+	Active         bool
+	RemovedAt      time.Time
 	OpenPRs        int
 	HighRiskPRs    int
 	LastActivity   time.Time
@@ -220,6 +224,8 @@ type AuditReport struct {
 
 type RepositoryReport struct {
 	RepositoryFullName string
+	Active             bool
+	RemovedAt          time.Time
 	RiskDistribution   []RiskBucket
 	PullRequests       []PRSummary
 	Findings           []FindingReport
@@ -233,6 +239,8 @@ type MetricsSnapshot struct {
 	ReviewRunsByStatus     map[string]int
 	ApprovalChecksByResult map[string]int
 	TotalRepositories      int
+	ActiveRepositories     int
+	InactiveRepositories   int
 	TotalPullRequests      int
 	TotalOpenFindings      int
 }

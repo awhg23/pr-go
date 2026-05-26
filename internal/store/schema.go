@@ -18,9 +18,12 @@ func SchemaStatements() []string {
   full_name VARCHAR(512) NOT NULL UNIQUE,
   default_branch VARCHAR(255) NOT NULL DEFAULT '',
   config_revision VARCHAR(255) NOT NULL DEFAULT '',
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  removed_at TIMESTAMP NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  INDEX idx_repositories_installation_id (installation_id)
+  INDEX idx_repositories_installation_id (installation_id),
+  INDEX idx_repositories_active (active)
 )`,
 		`CREATE TABLE IF NOT EXISTS pull_requests (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,

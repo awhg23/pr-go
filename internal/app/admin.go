@@ -26,7 +26,7 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
+	if !s.requireAdminScope(w, r, "metrics") {
 		return
 	}
 	metrics, err := s.store.Metrics(r.Context())
@@ -107,7 +107,16 @@ func (s *Server) handleRepositoryAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
-	if s.cfg.AdminToken == "" {
+	return s.requireAdminScope(w, r, "read")
+}
+
+func (s *Server) requireAdminScope(w http.ResponseWriter, r *http.Request, scope string) bool {
+	credentials, err := parseAdminCredentials(s.cfg.AdminToken, s.cfg.AdminTokens)
+	if err != nil {
+		http.Error(w, "admin auth config error", http.StatusInternalServerError)
+		return false
+	}
+	if len(credentials) == 0 {
 		http.NotFound(w, r)
 		return false
 	}
@@ -115,11 +124,70 @@ func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 	if got == "" {
 		got = r.URL.Query().Get("token")
 	}
-	if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.AdminToken)) != 1 {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return false
+	for _, credential := range credentials {
+		if subtle.ConstantTimeCompare([]byte(got), []byte(credential.Token)) == 1 {
+			if credential.Allows(scope) {
+				return true
+			}
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return false
+		}
 	}
-	return true
+	http.Error(w, "unauthorized", http.StatusUnauthorized)
+	return false
+}
+
+type adminCredential struct {
+	Name   string
+	Token  string
+	Scopes map[string]bool
+}
+
+func (c adminCredential) Allows(scope string) bool {
+	return c.Scopes["admin"] || c.Scopes[scope]
+}
+
+func parseAdminCredentials(legacyToken string, rawTokens string) ([]adminCredential, error) {
+	var credentials []adminCredential
+	if strings.TrimSpace(legacyToken) != "" {
+		credentials = append(credentials, adminCredential{
+			Name:   "legacy",
+			Token:  strings.TrimSpace(legacyToken),
+			Scopes: map[string]bool{"admin": true},
+		})
+	}
+	for _, entry := range strings.FieldsFunc(rawTokens, func(r rune) bool {
+		return r == ';' || r == '\n'
+	}) {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		parts := strings.SplitN(entry, ":", 3)
+		if len(parts) < 2 {
+			return nil, fmt.Errorf("admin token entry %q must be name:token[:scopes]", entry)
+		}
+		name := strings.TrimSpace(parts[0])
+		token := strings.TrimSpace(parts[1])
+		if name == "" || token == "" {
+			return nil, fmt.Errorf("admin token entry %q has empty name or token", entry)
+		}
+		scopes := map[string]bool{"read": true}
+		if len(parts) == 3 && strings.TrimSpace(parts[2]) != "" {
+			scopes = map[string]bool{}
+			for _, scope := range strings.Split(parts[2], ",") {
+				scope = strings.TrimSpace(scope)
+				if scope != "" {
+					scopes[scope] = true
+				}
+			}
+		}
+		if len(scopes) == 0 {
+			return nil, fmt.Errorf("admin token entry %q has no scopes", entry)
+		}
+		credentials = append(credentials, adminCredential{Name: name, Token: token, Scopes: scopes})
+	}
+	return credentials, nil
 }
 
 func writeJSON(w http.ResponseWriter, value any) {
@@ -136,6 +204,8 @@ func renderMetrics(metrics store.MetricsSnapshot) string {
 	writeMetricMap(&b, "pr_go_review_runs", "status", metrics.ReviewRunsByStatus)
 	writeMetricMap(&b, "pr_go_approval_checks", "result", metrics.ApprovalChecksByResult)
 	fmt.Fprintf(&b, "pr_go_repositories_total %d\n", metrics.TotalRepositories)
+	fmt.Fprintf(&b, "pr_go_repositories_active_total %d\n", metrics.ActiveRepositories)
+	fmt.Fprintf(&b, "pr_go_repositories_inactive_total %d\n", metrics.InactiveRepositories)
 	fmt.Fprintf(&b, "pr_go_pull_requests_total %d\n", metrics.TotalPullRequests)
 	fmt.Fprintf(&b, "pr_go_open_findings_total %d\n", metrics.TotalOpenFindings)
 	return b.String()
@@ -169,18 +239,19 @@ var adminHomeTemplate = template.Must(template.New("admin-home").Parse(`<!doctyp
   <h1>PR Approval Agent</h1>
   <p>Repositories with recorded activity.</p>
   <table>
-    <thead><tr><th>Repository</th><th>Installation</th><th>Open PRs</th><th>High Risk PRs</th><th>Last Activity</th></tr></thead>
+    <thead><tr><th>Repository</th><th>Status</th><th>Installation</th><th>Open PRs</th><th>High Risk PRs</th><th>Last Activity</th></tr></thead>
     <tbody>
       {{range .Repositories}}
       <tr>
         <td><a href="/admin/repo?full_name={{.FullName | urlquery}}{{if $.Token}}&token={{$.Token | urlquery}}{{end}}">{{.FullName}}</a></td>
+        <td>{{if .Active}}active{{else}}removed{{end}}</td>
         <td>{{.InstallationID}}</td>
         <td>{{.OpenPRs}}</td>
         <td>{{.HighRiskPRs}}</td>
         <td>{{.LastActivity}}</td>
       </tr>
       {{else}}
-      <tr><td colspan="5">No repositories recorded yet.</td></tr>
+      <tr><td colspan="6">No repositories recorded yet.</td></tr>
       {{end}}
     </tbody>
   </table>
@@ -204,6 +275,7 @@ var adminRepoTemplate = template.Must(template.New("admin-repo").Parse(`<!doctyp
 <body>
   <p><a href="/admin{{if .Token}}?token={{.Token | urlquery}}{{end}}">Back to repositories</a></p>
   <h1>{{.Report.RepositoryFullName}}</h1>
+  <p>Status: {{if .Report.Active}}active{{else}}removed{{if not .Report.RemovedAt.IsZero}} at {{.Report.RemovedAt}}{{end}}{{end}}</p>
   <h2>Risk Distribution</h2>
   <table><thead><tr><th>Level</th><th>Count</th></tr></thead><tbody>
     {{range .Report.RiskDistribution}}<tr><td>{{.Level}}</td><td>{{.Count}}</td></tr>{{else}}<tr><td colspan="2">No risk scores yet.</td></tr>{{end}}

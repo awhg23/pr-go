@@ -51,7 +51,7 @@ MYSQL_DSN='user:pass@tcp(mysql:3306)/pr_go?parseTime=true'
 OPENAI_API_KEY=sk-xxx
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4.1-mini
-PR_GO_ADMIN_TOKEN='long-random-admin-token'
+PR_GO_ADMIN_TOKENS='viewer:long-random-read-token:read;ops:long-random-metrics-token:metrics'
 ```
 
 Run:
@@ -178,6 +178,7 @@ Useful server flags:
 --max-retries     maximum async review attempts
 --queue-poll      persistent queue poll interval
 --admin-token     admin dashboard/API bearer token
+--admin-tokens    semicolon-separated admin tokens: name:token:scope1,scope2
 --alert-webhook   optional alert webhook URL for final job failures
 ```
 
@@ -285,5 +286,6 @@ V5 is the final usable app shape:
 - Prometheus-style metrics for deliveries, jobs, review runs, approval checks, repositories, PRs, and open findings.
 - `/readyz` verifies MySQL connectivity.
 - Optional final-failure alert webhook via `PR_GO_ALERT_WEBHOOK_URL`.
-- Admin dashboard, APIs, and metrics require `PR_GO_ADMIN_TOKEN`.
+- Admin dashboard, APIs, and metrics require `PR_GO_ADMIN_TOKEN` or scoped `PR_GO_ADMIN_TOKENS`.
+- Removed GitHub App repositories are marked inactive and remain visible for audit history.
 - OpenAI-compatible providers include `openai`, `openai-compatible`, `deepseek`, `siliconflow`, `ollama`, and `mock`.

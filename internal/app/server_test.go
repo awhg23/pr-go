@@ -146,6 +146,7 @@ func TestAdminRepositoriesAPI(t *testing.T) {
 		cfg: ServerConfig{AdminToken: "secret"},
 		store: &fakeStore{repos: []store.RepositorySummary{{
 			FullName: "owner/repo",
+			Active:   true,
 			OpenPRs:  2,
 		}}},
 		logger: discardLogger(t),
@@ -160,6 +161,38 @@ func TestAdminRepositoriesAPI(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "owner/repo") {
 		t.Fatalf("body missing repository: %s", rec.Body.String())
+	}
+}
+
+func TestAdminScopedTokens(t *testing.T) {
+	server := &Server{
+		cfg: ServerConfig{AdminTokens: "viewer:view-token:read;ops:ops-token:metrics"},
+		store: &fakeStore{repos: []store.RepositorySummary{{
+			FullName: "owner/repo",
+			Active:   true,
+		}}},
+		logger: discardLogger(t),
+	}
+
+	readReq := httptest.NewRequest(http.MethodGet, "/api/v1/repositories?token=view-token", nil)
+	readRec := httptest.NewRecorder()
+	server.handleRepositoriesAPI(readRec, readReq)
+	if readRec.Code != http.StatusOK {
+		t.Fatalf("read status = %d, want 200", readRec.Code)
+	}
+
+	metricsReq := httptest.NewRequest(http.MethodGet, "/metrics?token=view-token", nil)
+	metricsRec := httptest.NewRecorder()
+	server.handleMetrics(metricsRec, metricsReq)
+	if metricsRec.Code != http.StatusForbidden {
+		t.Fatalf("metrics status = %d, want 403", metricsRec.Code)
+	}
+
+	opsReq := httptest.NewRequest(http.MethodGet, "/metrics?token=ops-token", nil)
+	opsRec := httptest.NewRecorder()
+	server.handleMetrics(opsRec, opsReq)
+	if opsRec.Code != http.StatusOK {
+		t.Fatalf("ops metrics status = %d, want 200", opsRec.Code)
 	}
 }
 
@@ -185,17 +218,60 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 }
 
+func TestInstallationRepositoriesRemovedDeactivatesRepository(t *testing.T) {
+	fake := &fakeStore{deactivateOK: true}
+	server := &Server{store: fake, logger: discardLogger(t)}
+	event := WebhookEvent{
+		Event:        EventInstallationRepositories,
+		Action:       "removed",
+		Installation: Installation{ID: 99},
+		RepositoriesRemoved: []Repository{{
+			FullName: "owner/repo",
+		}},
+		Sender: Sender{Login: "owner"},
+	}
+
+	if err := server.handleInstallationEvent(context.Background(), event); err != nil {
+		t.Fatalf("handleInstallationEvent returned error: %v", err)
+	}
+	if fake.deactivatedFullName != "owner/repo" {
+		t.Fatalf("deactivated = %q, want owner/repo", fake.deactivatedFullName)
+	}
+}
+
+func TestInstallationDeletedDeactivatesInstalledRepositories(t *testing.T) {
+	fake := &fakeStore{installationDBID: 42}
+	server := &Server{store: fake, logger: discardLogger(t)}
+	event := WebhookEvent{
+		Event:        EventInstallation,
+		Action:       "deleted",
+		Installation: Installation{ID: 99},
+		Sender:       Sender{Login: "owner"},
+	}
+
+	if err := server.handleInstallationEvent(context.Background(), event); err != nil {
+		t.Fatalf("handleInstallationEvent returned error: %v", err)
+	}
+	if fake.deactivatedInstall != 42 {
+		t.Fatalf("deactivated installation = %d, want 42", fake.deactivatedInstall)
+	}
+}
+
 func discardLogger(t *testing.T) *log.Logger {
 	t.Helper()
 	return log.New(io.Discard, "", 0)
 }
 
 type fakeStore struct {
-	inserted bool
-	recorded store.Delivery
-	repos    []store.RepositorySummary
-	report   store.RepositoryReport
-	metrics  store.MetricsSnapshot
+	inserted            bool
+	recorded            store.Delivery
+	repos               []store.RepositorySummary
+	report              store.RepositoryReport
+	metrics             store.MetricsSnapshot
+	installationDBID    int64
+	deactivateOK        bool
+	deactivatedFullName string
+	deactivatedInstall  int64
 }
 
 func (f *fakeStore) EnsureSchema(context.Context) error { return nil }
@@ -217,10 +293,18 @@ func (f *fakeStore) RetryWebhookJob(context.Context, int64, string, time.Time) e
 }
 func (f *fakeStore) FailWebhookJob(context.Context, int64, string) error { return nil }
 func (f *fakeStore) UpsertInstallation(context.Context, store.Installation) (int64, error) {
-	return 0, nil
+	return f.installationDBID, nil
 }
 func (f *fakeStore) UpsertRepository(context.Context, store.Repository) (int64, error) {
 	return 0, nil
+}
+func (f *fakeStore) DeactivateRepository(_ context.Context, fullName string) (int64, bool, error) {
+	f.deactivatedFullName = fullName
+	return 1, f.deactivateOK, nil
+}
+func (f *fakeStore) DeactivateRepositoriesByInstallation(_ context.Context, installationDBID int64) ([]int64, error) {
+	f.deactivatedInstall = installationDBID
+	return []int64{1}, nil
 }
 func (f *fakeStore) UpsertPullRequest(context.Context, store.PullRequest) (int64, error) {
 	return 0, nil

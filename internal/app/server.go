@@ -31,6 +31,7 @@ type ServerConfig struct {
 	RetryDelay    time.Duration
 	QueuePoll     time.Duration
 	AdminToken    string
+	AdminTokens   string
 	AlertWebhook  string
 }
 
@@ -77,6 +78,9 @@ func NewServer(cfg ServerConfig, logger *log.Logger) (*Server, error) {
 	}
 	if cfg.QueuePoll == 0 {
 		cfg.QueuePoll = 2 * time.Second
+	}
+	if _, err := parseAdminCredentials(cfg.AdminToken, cfg.AdminTokens); err != nil {
+		return nil, err
 	}
 	if logger == nil {
 		logger = log.Default()

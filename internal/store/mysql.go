@@ -208,12 +208,70 @@ ON DUPLICATE KEY UPDATE
   owner = VALUES(owner),
   name = VALUES(name),
   default_branch = VALUES(default_branch),
+  active = TRUE,
+  removed_at = NULL,
   updated_at = CURRENT_TIMESTAMP`,
 		repo.InstallationDBID, repo.Owner, repo.Name, repo.FullName, repo.DefaultBranch)
 	if err != nil {
 		return 0, err
 	}
 	return res.LastInsertId()
+}
+
+func (s *MySQLStore) DeactivateRepository(ctx context.Context, fullName string) (int64, bool, error) {
+	if strings.TrimSpace(fullName) == "" {
+		return 0, false, fmt.Errorf("repository full name is required")
+	}
+	var repoID int64
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM repositories WHERE full_name = ?`, fullName).Scan(&repoID)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	_, err = s.db.ExecContext(ctx, `
+UPDATE repositories
+SET active = FALSE, removed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+WHERE id = ?`, repoID)
+	if err != nil {
+		return 0, false, err
+	}
+	return repoID, true, nil
+}
+
+func (s *MySQLStore) DeactivateRepositoriesByInstallation(ctx context.Context, installationDBID int64) ([]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id
+FROM repositories
+WHERE installation_id = ? AND active = TRUE`, installationDBID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return ids, nil
+	}
+	_, err = s.db.ExecContext(ctx, `
+UPDATE repositories
+SET active = FALSE, removed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+WHERE installation_id = ? AND active = TRUE`, installationDBID)
+	if err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 func (s *MySQLStore) UpsertPullRequest(ctx context.Context, pr PullRequest) (int64, error) {
@@ -492,7 +550,7 @@ func (s *MySQLStore) ListRepositorySummaries(ctx context.Context, limit int) ([]
 		limit = 50
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT repo.id, gi.installation_id, repo.full_name,
+SELECT repo.id, gi.installation_id, repo.full_name, repo.active, repo.removed_at,
   (SELECT COUNT(*) FROM pull_requests pr WHERE pr.repository_id = repo.id AND pr.state = 'open') AS open_prs,
   (SELECT COUNT(DISTINCT pr2.id)
    FROM pull_requests pr2
@@ -502,7 +560,7 @@ SELECT repo.id, gi.installation_id, repo.full_name,
 FROM repositories repo
 JOIN github_installations gi ON gi.id = repo.installation_id
 LEFT JOIN pull_requests pr ON pr.repository_id = repo.id
-GROUP BY repo.id, gi.installation_id, repo.full_name, repo.updated_at
+GROUP BY repo.id, gi.installation_id, repo.full_name, repo.active, repo.removed_at, repo.updated_at
 ORDER BY last_activity DESC
 LIMIT ?`, limit)
 	if err != nil {
@@ -513,8 +571,12 @@ LIMIT ?`, limit)
 	var out []RepositorySummary
 	for rows.Next() {
 		var item RepositorySummary
-		if err := rows.Scan(&item.ID, &item.InstallationID, &item.FullName, &item.OpenPRs, &item.HighRiskPRs, &item.LastActivity); err != nil {
+		var removed sql.NullTime
+		if err := rows.Scan(&item.ID, &item.InstallationID, &item.FullName, &item.Active, &removed, &item.OpenPRs, &item.HighRiskPRs, &item.LastActivity); err != nil {
 			return nil, err
+		}
+		if removed.Valid {
+			item.RemovedAt = removed.Time
 		}
 		out = append(out, item)
 	}
@@ -529,10 +591,14 @@ func (s *MySQLStore) RepositoryReport(ctx context.Context, fullName string, limi
 		limit = 50
 	}
 	var repoID int64
-	if err := s.db.QueryRowContext(ctx, `SELECT id FROM repositories WHERE full_name = ?`, fullName).Scan(&repoID); err != nil {
+	var removed sql.NullTime
+	report := RepositoryReport{RepositoryFullName: fullName}
+	if err := s.db.QueryRowContext(ctx, `SELECT id, active, removed_at FROM repositories WHERE full_name = ?`, fullName).Scan(&repoID, &report.Active, &removed); err != nil {
 		return RepositoryReport{}, err
 	}
-	report := RepositoryReport{RepositoryFullName: fullName}
+	if removed.Valid {
+		report.RemovedAt = removed.Time
+	}
 
 	buckets, err := s.queryRiskBuckets(ctx, repoID)
 	if err != nil {
@@ -583,6 +649,12 @@ func (s *MySQLStore) Metrics(ctx context.Context) (MetricsSnapshot, error) {
 		return MetricsSnapshot{}, err
 	}
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repositories`).Scan(&out.TotalRepositories); err != nil {
+		return MetricsSnapshot{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repositories WHERE active = TRUE`).Scan(&out.ActiveRepositories); err != nil {
+		return MetricsSnapshot{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repositories WHERE active = FALSE`).Scan(&out.InactiveRepositories); err != nil {
 		return MetricsSnapshot{}, err
 	}
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pull_requests`).Scan(&out.TotalPullRequests); err != nil {
