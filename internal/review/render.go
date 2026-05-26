@@ -15,6 +15,12 @@ func RenderMarkdown(input Input, result Result) string {
 	fmt.Fprintf(&b, "- Author: `%s`\n", input.AuthorLogin)
 	fmt.Fprintf(&b, "- Schema: `%s`, Prompt: `%s`\n", result.SchemaVersion, result.PromptVersion)
 	fmt.Fprintf(&b, "- Files: %d, additions: %d, deletions: %d\n", input.ChangedCount, input.TotalAdditions, input.TotalDeletions)
+	if len(input.IgnoredFiles) > 0 {
+		fmt.Fprintf(&b, "- Policy ignored files: %s\n", strings.Join(input.IgnoredFiles, ", "))
+	}
+	for _, warning := range input.PolicyWarnings {
+		fmt.Fprintf(&b, "- Policy warning: %s\n", warning)
+	}
 	if input.DiffTruncated {
 		fmt.Fprintf(&b, "- Diff: compressed to %d bytes, omitted about %d bytes\n", input.MaxDiffBytes, input.OmittedBytes)
 	}
@@ -53,6 +59,13 @@ func RenderGitHubComment(input Input, result Result, checks github.ChecksSummary
 	fmt.Fprintf(&b, "**Risk Level:** `%s`  \n", strings.ToUpper(result.Risk.Level))
 	fmt.Fprintf(&b, "**Risk Score:** `%d`  \n", result.Risk.Score)
 	fmt.Fprintf(&b, "**CI/Checks:** `%s`\n\n", checks.State)
+	if len(input.PolicyWarnings) > 0 {
+		fmt.Fprintf(&b, "### Policy Warnings\n\n")
+		for _, warning := range input.PolicyWarnings {
+			fmt.Fprintf(&b, "- %s\n", warning)
+		}
+		fmt.Fprintf(&b, "\n")
+	}
 
 	fmt.Fprintf(&b, "### Key Reasons\n\n")
 	for _, reason := range result.Risk.Reasons {
@@ -91,6 +104,6 @@ func RenderGitHubComment(input Input, result Result, checks github.ChecksSummary
 	if checks.State != "success" {
 		fmt.Fprintf(&b, "- Wait for CI/checks to become successful before final approval.\n")
 	}
-	fmt.Fprintf(&b, "- This V1 MVP never approves or merges PRs automatically.\n")
+	fmt.Fprintf(&b, "- Auto approve is disabled unless repository policy explicitly enables it and the final approval check passes.\n")
 	return b.String()
 }

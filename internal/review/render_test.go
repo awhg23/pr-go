@@ -17,7 +17,7 @@ func TestRenderGitHubCommentIncludesRiskChecksAndNoApprove(t *testing.T) {
 		github.ChecksSummary{State: "success", Details: []string{"test=success"}},
 	)
 
-	for _, want := range []string{"PR Approval Agent", "Risk Level", "test=success", "Next Steps", "never approves or merges"} {
+	for _, want := range []string{"PR Approval Agent", "Risk Level", "test=success", "Next Steps", "Auto approve is disabled unless repository policy explicitly enables it"} {
 		if !strings.Contains(comment, want) {
 			t.Fatalf("comment missing %q:\n%s", want, comment)
 		}

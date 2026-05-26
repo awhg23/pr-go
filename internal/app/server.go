@@ -311,6 +311,7 @@ func (s *Server) reviewPullRequest(ctx context.Context, event WebhookEvent, trig
 	if err != nil {
 		return s.handleJobError(ctx, repoID, prID, runID, actor, "github_fetch_pr_failed", err)
 	}
+	policyConfig, policyWarnings := loadRepositoryPolicy(ctx, gh, ref, pr.BaseSHA)
 	prID, err = s.store.UpsertPullRequest(ctx, store.PullRequest{
 		RepositoryID:   repoID,
 		Number:         pr.Ref.Number,
@@ -327,6 +328,19 @@ func (s *Server) reviewPullRequest(ctx context.Context, event WebhookEvent, trig
 	if err := s.store.UpdateReviewRunHeadSHA(ctx, runID, pr.HeadSHA); err != nil {
 		return s.handleJobError(ctx, repoID, prID, runID, actor, "mysql_write_failed", fmt.Errorf("record review run head sha: %w", err))
 	}
+	for _, warning := range policyWarnings {
+		if err := gh.CreateIssueComment(ctx, ref, warning); err != nil {
+			s.logger.Printf("publish policy warning failed repo=%s pr=%d: %v", event.Repository.FullName, pr.Ref.Number, err)
+		}
+		detail, _ := json.Marshal(map[string]string{"warning": warning})
+		_ = s.store.Audit(ctx, store.AuditLog{
+			RepositoryID:  repoID,
+			PullRequestID: prID,
+			Actor:         actor,
+			Action:        "policy_config_warning",
+			DetailJSON:    string(detail),
+		})
+	}
 	checks, err := gh.FetchChecksSummary(ctx, ref, pr.HeadSHA)
 	if err != nil {
 		s.logger.Printf("checks unavailable repo=%s pr=%d: %v", event.Repository.FullName, event.PullRequest.Number, err)
@@ -341,9 +355,13 @@ func (s *Server) reviewPullRequest(ctx context.Context, event WebhookEvent, trig
 		})
 	}
 
-	input := review.BuildInput(pr, s.cfg.MaxDiffBytes)
+	input := buildReviewInput(pr, s.cfg.MaxDiffBytes, policyConfig, policyWarnings)
 	input.CheckStatus = checks.State
-	result, err := s.reviewer.Review(ctx, input)
+	reviewer, err := s.reviewerForPolicy(policyConfig)
+	if err != nil {
+		return s.handleJobError(ctx, repoID, prID, runID, actor, "policy_config_failed", fmt.Errorf("create reviewer from policy: %w", err))
+	}
+	result, err := reviewer.Review(ctx, input)
 	if err != nil {
 		_ = s.store.SaveModelInvocation(ctx, runID, &review.ModelInvocation{
 			Provider:     s.cfg.Provider,
@@ -353,7 +371,7 @@ func (s *Server) reviewPullRequest(ctx context.Context, event WebhookEvent, trig
 		return s.handleJobError(ctx, repoID, prID, runID, actor, "llm_review_failed", fmt.Errorf("review with provider: %w", err))
 	}
 	review.EnsureSchema(&result)
-	result.Risk = review.ScoreRisk(input, result.Findings)
+	result.Risk = review.ScoreRiskWithOptions(input, result.Findings, riskOptionsFromPolicy(policyConfig))
 
 	if err := s.store.SaveModelInvocation(ctx, runID, result.ModelInvocation); err != nil {
 		return s.handleJobError(ctx, repoID, prID, runID, actor, "mysql_write_failed", fmt.Errorf("record model invocation: %w", err))

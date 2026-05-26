@@ -1,8 +1,22 @@
 package review
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/awhg23/pr-go/internal/policy"
+)
 
 func ScoreRisk(input Input, findings []Finding) Risk {
+	return ScoreRiskWithOptions(input, findings, RiskOptions{})
+}
+
+type RiskOptions struct {
+	HighRiskPaths       []string
+	RequireChangedTests bool
+	TestFilePatterns    []string
+}
+
+func ScoreRiskWithOptions(input Input, findings []Finding, options RiskOptions) Risk {
 	score := 10
 	reasons := []string{"base review risk starts at 10"}
 
@@ -43,11 +57,15 @@ func ScoreRisk(input Input, findings []Finding) Risk {
 		reasons = append(reasons, "CI/check status is not confirmed")
 	}
 	for _, file := range input.ChangedFiles {
-		if isHighRiskPath(file.Path) {
+		if isHighRiskPath(file.Path, options.HighRiskPaths) {
 			score += 15
-			reasons = append(reasons, "high-risk path changed: "+file.Path)
+			reasons = append(reasons, "high-risk path changed by policy: "+file.Path)
 			break
 		}
+	}
+	if options.RequireChangedTests && !hasChangedTests(input.ChangedFiles, options.TestFilePatterns) {
+		score += 15
+		reasons = append(reasons, "repository policy requires changed tests")
 	}
 
 	if score > 100 {
@@ -69,12 +87,36 @@ func riskLevel(score int) string {
 	}
 }
 
-func isHighRiskPath(path string) bool {
-	path = strings.ToLower(path)
-	patterns := []string{"auth", "permission", "migrations", "migration", "payment", "secret", "security", "go.mod", "package.json"}
-	for _, pattern := range patterns {
-		if strings.Contains(path, pattern) {
+func isHighRiskPath(path string, patterns []string) bool {
+	if len(patterns) > 0 && policy.MatchAny(patterns, path) {
+		return true
+	}
+	lower := strings.ToLower(path)
+	fallbacks := []string{"auth", "permission", "migrations", "migration", "payment", "secret", "security", "go.mod", "package.json"}
+	for _, pattern := range fallbacks {
+		if strings.Contains(lower, pattern) {
 			return true
+		}
+	}
+	return false
+}
+
+func hasChangedTests(files []FileDiff, patterns []string) bool {
+	for _, file := range files {
+		if policy.MatchAny(patterns, file.Path) {
+			return true
+		}
+	}
+	if len(patterns) > 0 {
+		return false
+	}
+	for _, file := range files {
+		path := strings.ToLower(file.Path)
+		defaults := []string{"_test.go", "/test/", "/tests/", ".spec.", ".test."}
+		for _, pattern := range defaults {
+			if strings.Contains(path, pattern) {
+				return true
+			}
 		}
 	}
 	return false

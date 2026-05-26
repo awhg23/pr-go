@@ -148,6 +148,76 @@ func TestHandleApproveCheckCommandSavesDecision(t *testing.T) {
 	}
 }
 
+func TestHandleApproveCheckCommandAutoApprovesWhenPolicyEnabled(t *testing.T) {
+	st := &commandStore{
+		risk:    store.RiskSnapshot{Level: "low", Score: 10},
+		hasRisk: true,
+		run:     store.ReviewRunSnapshot{ID: 7, HeadSHA: "sha"},
+		hasRun:  true,
+	}
+	gh := &fakeCommandGitHub{
+		pr: github.PullRequest{
+			Ref:         github.PullRequestRef{Owner: "owner", Repo: "repo", Number: 1},
+			Title:       "PR",
+			AuthorLogin: "octo",
+			BaseSHA:     "base",
+			HeadSHA:     "sha",
+		},
+		checks:      github.ChecksSummary{State: "success"},
+		policyFound: true,
+		policyRaw: `version: 1
+approval:
+  auto_approve:
+    enabled: true
+`,
+	}
+	server := &Server{store: st}
+	cmdCtx := commandContext{Ref: github.PullRequestRef{Owner: "owner", Repo: "repo", Number: 1}, Actor: "maintainer", RepoID: 5, PRID: 10, CommandID: 20, GitHub: gh}
+
+	if err := server.handleApproveCheckCommand(context.Background(), cmdCtx); err != nil {
+		t.Fatalf("handleApproveCheckCommand error = %v", err)
+	}
+	if !gh.approved {
+		t.Fatal("expected approve API to be called")
+	}
+	if !st.approval.AutoApproved {
+		t.Fatal("approval check should record auto approved")
+	}
+	if st.approvalStatus != "auto_approved" {
+		t.Fatalf("approval status = %q, want auto_approved", st.approvalStatus)
+	}
+	if len(gh.comments) != 1 || !strings.Contains(gh.comments[0], "Auto Approve: `approved`") {
+		t.Fatalf("comment = %#v, want auto approve success", gh.comments)
+	}
+}
+
+func TestHandleApproveCheckInvalidPolicyCommentsWarningAndUsesDefault(t *testing.T) {
+	st := &commandStore{
+		risk:    store.RiskSnapshot{Level: "low", Score: 10},
+		hasRisk: true,
+		run:     store.ReviewRunSnapshot{ID: 7, HeadSHA: "sha"},
+		hasRun:  true,
+	}
+	gh := &fakeCommandGitHub{
+		pr:          github.PullRequest{Ref: github.PullRequestRef{Owner: "owner", Repo: "repo", Number: 1}, BaseSHA: "base", HeadSHA: "sha"},
+		checks:      github.ChecksSummary{State: "success"},
+		policyFound: true,
+		policyRaw:   "version: nope\n",
+	}
+	server := &Server{store: st}
+	cmdCtx := commandContext{Ref: github.PullRequestRef{Owner: "owner", Repo: "repo", Number: 1}, Actor: "maintainer", RepoID: 5, PRID: 10, CommandID: 20, GitHub: gh}
+
+	if err := server.handleApproveCheckCommand(context.Background(), cmdCtx); err != nil {
+		t.Fatalf("handleApproveCheckCommand error = %v", err)
+	}
+	if gh.approved {
+		t.Fatal("invalid config should fall back to default auto approve disabled")
+	}
+	if len(gh.comments) != 2 || !strings.Contains(gh.comments[0], "配置无效") {
+		t.Fatalf("comments = %#v, want config warning then result", gh.comments)
+	}
+}
+
 type commandStore struct {
 	fakeStore
 	risk           store.RiskSnapshot
@@ -212,10 +282,13 @@ func (s *commandStore) Audit(_ context.Context, log store.AuditLog) error {
 }
 
 type fakeCommandGitHub struct {
-	permission string
-	comments   []string
-	pr         github.PullRequest
-	checks     github.ChecksSummary
+	permission  string
+	comments    []string
+	pr          github.PullRequest
+	checks      github.ChecksSummary
+	policyRaw   string
+	policyFound bool
+	approved    bool
 }
 
 func (g *fakeCommandGitHub) FetchCollaboratorPermission(context.Context, github.PullRequestRef, string) (string, error) {
@@ -233,4 +306,13 @@ func (g *fakeCommandGitHub) FetchPullRequest(context.Context, github.PullRequest
 
 func (g *fakeCommandGitHub) FetchChecksSummary(context.Context, github.PullRequestRef, string) (github.ChecksSummary, error) {
 	return g.checks, nil
+}
+
+func (g *fakeCommandGitHub) FetchTextFile(context.Context, github.PullRequestRef, string, string) (string, bool, error) {
+	return g.policyRaw, g.policyFound, nil
+}
+
+func (g *fakeCommandGitHub) ApprovePullRequest(context.Context, github.PullRequestRef, string) error {
+	g.approved = true
+	return nil
 }

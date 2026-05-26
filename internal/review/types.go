@@ -18,6 +18,9 @@ type Input struct {
 	OmittedBytes   int
 	MaxDiffBytes   int
 	ChangedCount   int
+	IgnoredFiles   []string
+	OutputLanguage string
+	PolicyWarnings []string
 	TotalAdditions int
 	TotalDeletions int
 }

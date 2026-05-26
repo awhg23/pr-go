@@ -3,6 +3,7 @@ package github
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -137,6 +138,15 @@ func (c *Client) CreateIssueComment(ctx context.Context, ref PullRequestRef, bod
 	return c.postJSON(ctx, path, payload, nil)
 }
 
+func (c *Client) ApprovePullRequest(ctx context.Context, ref PullRequestRef, body string) error {
+	path := fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews", ref.Owner, ref.Repo, ref.Number)
+	payload := map[string]string{
+		"event": "APPROVE",
+		"body":  body,
+	}
+	return c.postJSON(ctx, path, payload, nil)
+}
+
 func (c *Client) FetchCollaboratorPermission(ctx context.Context, ref PullRequestRef, username string) (string, error) {
 	if strings.TrimSpace(username) == "" {
 		return "", fmt.Errorf("username is required")
@@ -147,6 +157,55 @@ func (c *Client) FetchCollaboratorPermission(ctx context.Context, ref PullReques
 		return "", err
 	}
 	return payload.Permission, nil
+}
+
+func (c *Client) FetchTextFile(ctx context.Context, ref PullRequestRef, filePath string, gitRef string) (string, bool, error) {
+	escapedPath := escapePath(filePath)
+	path := fmt.Sprintf("/repos/%s/%s/contents/%s", ref.Owner, ref.Repo, escapedPath)
+	if strings.TrimSpace(gitRef) != "" {
+		path += "?ref=" + url.QueryEscape(gitRef)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiBaseURL+path, nil)
+	if err != nil {
+		return "", false, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return "", false, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", false, fmt.Errorf("github api returned %s", resp.Status)
+	}
+
+	var payload struct {
+		Content  string `json:"content"`
+		Encoding string `json:"encoding"`
+		Type     string `json:"type"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", false, err
+	}
+	if payload.Type != "" && payload.Type != "file" {
+		return "", false, fmt.Errorf("%s is not a file", filePath)
+	}
+	if payload.Encoding != "base64" {
+		return "", false, fmt.Errorf("unsupported content encoding %q", payload.Encoding)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(payload.Content, "\n", ""))
+	if err != nil {
+		return "", false, fmt.Errorf("decode %s: %w", filePath, err)
+	}
+	return string(decoded), true, nil
 }
 
 func (c *Client) fetchFiles(ctx context.Context, ref PullRequestRef) ([]ChangedFile, error) {
@@ -162,6 +221,14 @@ func (c *Client) fetchFiles(ctx context.Context, ref PullRequestRef) ([]ChangedF
 			return all, nil
 		}
 	}
+}
+
+func escapePath(filePath string) string {
+	parts := strings.Split(strings.Trim(filePath, "/"), "/")
+	for i, part := range parts {
+		parts[i] = url.PathEscape(part)
+	}
+	return strings.Join(parts, "/")
 }
 
 func (c *Client) getJSON(ctx context.Context, path string, dst any) error {

@@ -5,14 +5,17 @@ import (
 	"strings"
 
 	"github.com/awhg23/pr-go/internal/github"
+	"github.com/awhg23/pr-go/internal/policy"
 	"github.com/awhg23/pr-go/internal/store"
 )
 
 type ApprovalDecision struct {
-	Result         string
-	Reasons        []string
-	ApprovalStatus string
-	ReviewRunID    int64
+	Result           string
+	Reasons          []string
+	ApprovalStatus   string
+	ReviewRunID      int64
+	AutoApproved     bool
+	AutoApproveError string
 }
 
 func DecideApproval(
@@ -23,6 +26,8 @@ func DecideApproval(
 	risk store.RiskSnapshot,
 	hasRisk bool,
 	findings []store.FindingSnapshot,
+	cfg policy.Config,
+	changedPaths []string,
 ) ApprovalDecision {
 	var reasons []string
 	reviewRunID := int64(0)
@@ -43,6 +48,10 @@ func DecideApproval(
 		blocked = true
 		reasons = append(reasons, fmt.Sprintf("CI/check 状态不是 success：%s。", checks.State))
 	}
+	for _, reason := range policy.RequiredCheckReasons(cfg.Approval.RequiredChecks, checks.Details) {
+		blocked = true
+		reasons = append(reasons, reason)
+	}
 
 	for _, finding := range findings {
 		switch strings.ToLower(finding.Severity) {
@@ -55,7 +64,7 @@ func DecideApproval(
 		}
 	}
 	if hasRisk {
-		switch risk.Level {
+		switch strings.ToLower(risk.Level) {
 		case "blocker", "high":
 			blocked = true
 			reasons = append(reasons, fmt.Sprintf("当前风险等级为 %s。", risk.Level))
@@ -66,6 +75,14 @@ func DecideApproval(
 	} else {
 		humanReview = true
 		reasons = append(reasons, "没有可用的风险评分记录。")
+	}
+	if cfg.Tests.RequireChangedTests && !policy.ChangedTestFileExists(changedPaths, cfg.Tests.TestFilePatterns) {
+		humanReview = true
+		reasons = append(reasons, "仓库策略要求本次 PR 包含测试变更。")
+	}
+	for _, reason := range policy.HumanReviewRuleReasons(cfg.Approval.RequireHumanWhen, risk.Level, checks.State, changedPaths) {
+		humanReview = true
+		reasons = append(reasons, reason)
 	}
 
 	if blocked {
@@ -82,7 +99,7 @@ func DecideApproval(
 	}
 }
 
-func RenderApproveCheckComment(decision ApprovalDecision, checks github.ChecksSummary, risk store.RiskSnapshot, hasRisk bool) string {
+func RenderApproveCheckComment(decision ApprovalDecision, checks github.ChecksSummary, risk store.RiskSnapshot, hasRisk bool, cfg policy.Config) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "## AI Approve Check\n\n")
 	fmt.Fprintf(&b, "**Result:** `%s`\n\n", decision.Result)
@@ -92,11 +109,27 @@ func RenderApproveCheckComment(decision ApprovalDecision, checks github.ChecksSu
 	} else {
 		fmt.Fprintf(&b, "- Risk: `unknown`\n")
 	}
+	if cfg.Approval.AutoApprove.Enabled {
+		switch {
+		case decision.AutoApproved:
+			fmt.Fprintf(&b, "- Auto Approve: `approved`\n")
+		case decision.AutoApproveError != "":
+			fmt.Fprintf(&b, "- Auto Approve: `failed` (%s)\n", decision.AutoApproveError)
+		default:
+			fmt.Fprintf(&b, "- Auto Approve: `enabled`\n")
+		}
+	} else {
+		fmt.Fprintf(&b, "- Auto Approve: `disabled`\n")
+	}
 	fmt.Fprintf(&b, "\n### Reasons\n\n")
 	for _, reason := range decision.Reasons {
 		fmt.Fprintf(&b, "- %s\n", reason)
 	}
-	fmt.Fprintf(&b, "\nV3 只输出审批建议，不会自动 approve 或 merge。\n")
+	if cfg.Approval.AutoApprove.Enabled {
+		fmt.Fprintf(&b, "\nV4 仅在仓库策略显式开启且最终检查通过时自动 approve。\n")
+	} else {
+		fmt.Fprintf(&b, "\nV4 默认不自动 approve；需要仓库策略显式开启。\n")
+	}
 	return b.String()
 }
 

@@ -15,13 +15,18 @@ import (
 )
 
 type OpenAIReviewer struct {
-	apiKey     string
-	baseURL    string
-	model      string
-	httpClient *http.Client
+	apiKey      string
+	baseURL     string
+	model       string
+	temperature float64
+	httpClient  *http.Client
 }
 
 func NewOpenAIReviewerFromEnv() *OpenAIReviewer {
+	return NewOpenAIReviewerFromEnvWithOptions(Options{})
+}
+
+func NewOpenAIReviewerFromEnvWithOptions(options Options) *OpenAIReviewer {
 	baseURL := os.Getenv("OPENAI_BASE_URL")
 	if baseURL == "" {
 		baseURL = "https://api.openai.com/v1"
@@ -30,10 +35,18 @@ func NewOpenAIReviewerFromEnv() *OpenAIReviewer {
 	if model == "" {
 		model = "gpt-4.1-mini"
 	}
+	if options.Model != "" && options.Model != "default" {
+		model = options.Model
+	}
+	temperature := 0.2
+	if options.Temperature != nil {
+		temperature = *options.Temperature
+	}
 	return &OpenAIReviewer{
-		apiKey:  os.Getenv("OPENAI_API_KEY"),
-		baseURL: strings.TrimRight(baseURL, "/"),
-		model:   model,
+		apiKey:      os.Getenv("OPENAI_API_KEY"),
+		baseURL:     strings.TrimRight(baseURL, "/"),
+		model:       model,
+		temperature: temperature,
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
@@ -51,7 +64,7 @@ func (r *OpenAIReviewer) Review(ctx context.Context, input review.Input) (review
 			{Role: "system", Content: systemPrompt()},
 			{Role: "user", Content: userPrompt(input)},
 		},
-		Temperature: 0.2,
+		Temperature: r.temperature,
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -149,13 +162,23 @@ Changed files: %d
 Additions: %d
 Deletions: %d
 Diff truncated: %t
+Preferred output language: %s
+Policy warnings: %s
 
 Description:
 %s
 
 Diff:
 %s`, input.Owner, input.Repo, input.Number, input.Title, input.AuthorLogin, input.BaseSHA, input.HeadSHA,
-		input.ChangedCount, input.TotalAdditions, input.TotalDeletions, input.DiffTruncated, input.Description, input.Diff)
+		input.ChangedCount, input.TotalAdditions, input.TotalDeletions, input.DiffTruncated,
+		emptyDefault(input.OutputLanguage, "default"), strings.Join(input.PolicyWarnings, "; "), input.Description, input.Diff)
+}
+
+func emptyDefault(value string, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 func stripJSONFence(content string) string {

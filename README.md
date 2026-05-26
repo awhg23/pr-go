@@ -160,3 +160,60 @@ Supported commands:
 - Only when the current head is reviewed, CI/checks pass, and no open high/blocker finding remains does it output `建议审批`.
 
 V3 still does not call GitHub approve or merge APIs.
+
+## V4 Repository Policy
+
+V4 reads `.pr-approval-agent.yml` from the PR base commit. This follows PR-Agent's repository-level configuration idea while keeping pr-go's stateful GitHub App and MySQL audit model.
+
+When the file is missing, pr-go uses safe defaults:
+
+- auto approve is disabled
+- CI/checks must be `success`
+- high/blocker findings block approval
+- auth, permission, migration, payment, secret, security, and dependency files are treated as high-risk areas
+- maintainer permission is required for comment commands
+
+If the config file is invalid, pr-go comments a readable warning on the PR, writes an audit record, and continues with safe defaults.
+
+Example:
+
+```yaml
+version: 1
+
+review:
+  language: zh-CN
+  ignore_files:
+    - "**/*.lock"
+    - "dist/**"
+    - "vendor/**"
+  high_risk_paths:
+    - "internal/auth/**"
+    - "migrations/**"
+    - "payment/**"
+
+approval:
+  auto_approve:
+    enabled: false
+  require_human_when:
+    - "risk_level >= high"
+    - "ci_status != success"
+    - "changed_files > 30"
+    - "path matches internal/auth/**"
+  required_checks:
+    - "test"
+    - "lint"
+  require_tests: false
+
+tests:
+  require_changed_tests: false
+  test_file_patterns:
+    - "**/*_test.go"
+    - "tests/**"
+
+model:
+  provider: openai-compatible
+  model: default
+  temperature: 0.2
+```
+
+`/ai-approve-check` applies required checks, human-review rules, and changed-test requirements. It only calls GitHub's approve API when the result is `建议审批` and `approval.auto_approve.enabled` is explicitly `true`.

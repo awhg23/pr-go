@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/awhg23/pr-go/internal/github"
+	"github.com/awhg23/pr-go/internal/policy"
 	"github.com/awhg23/pr-go/internal/store"
 )
 
@@ -32,6 +33,8 @@ type commandGitHubClient interface {
 	CreateIssueComment(context.Context, github.PullRequestRef, string) error
 	FetchPullRequest(context.Context, github.PullRequestRef) (github.PullRequest, error)
 	FetchChecksSummary(context.Context, github.PullRequestRef, string) (github.ChecksSummary, error)
+	FetchTextFile(context.Context, github.PullRequestRef, string, string) (string, bool, error)
+	ApprovePullRequest(context.Context, github.PullRequestRef, string) error
 }
 
 func (s *Server) handleCommand(ctx context.Context, event WebhookEvent) error {
@@ -210,6 +213,7 @@ func (s *Server) handleApproveCheckCommand(ctx context.Context, cmdCtx commandCo
 		_ = s.store.FinishCommentCommand(ctx, cmdCtx.CommandID, "failed", "", err.Error())
 		return err
 	}
+	policyConfig, policyWarnings := loadRepositoryPolicy(ctx, cmdCtx.GitHub, cmdCtx.Ref, pr.BaseSHA)
 	cmdCtx.PRID, err = s.store.UpsertPullRequest(ctx, store.PullRequest{
 		RepositoryID:   cmdCtx.RepoID,
 		Number:         pr.Ref.Number,
@@ -223,6 +227,13 @@ func (s *Server) handleApproveCheckCommand(ctx context.Context, cmdCtx commandCo
 	if err != nil {
 		_ = s.store.FinishCommentCommand(ctx, cmdCtx.CommandID, "failed", "", err.Error())
 		return err
+	}
+	for _, warning := range policyWarnings {
+		if err := cmdCtx.GitHub.CreateIssueComment(ctx, cmdCtx.Ref, warning); err != nil {
+			_ = s.store.FinishCommentCommand(ctx, cmdCtx.CommandID, "failed", "", err.Error())
+			return err
+		}
+		_ = s.auditCommand(ctx, cmdCtx, "policy_config_warning", map[string]string{"warning": warning})
 	}
 	checks, err := cmdCtx.GitHub.FetchChecksSummary(ctx, cmdCtx.Ref, pr.HeadSHA)
 	if err != nil {
@@ -244,14 +255,35 @@ func (s *Server) handleApproveCheckCommand(ctx context.Context, cmdCtx commandCo
 		return err
 	}
 
-	decision := DecideApproval(pr.HeadSHA, checks, run, hasRun, risk, hasRisk, findings)
+	changedPaths := changedFilePaths(pr.Files)
+	decision := DecideApproval(pr.HeadSHA, checks, run, hasRun, risk, hasRisk, findings, policyConfig, changedPaths)
+	if decision.Result == ApprovalRecommended && policyConfig.Approval.AutoApprove.Enabled {
+		body := "AI approval check passed and repository policy explicitly enabled auto approve."
+		if err := cmdCtx.GitHub.ApprovePullRequest(ctx, cmdCtx.Ref, body); err != nil {
+			decision.AutoApproveError = err.Error()
+			decision.ApprovalStatus = "auto_approve_failed"
+			decision.Reasons = append(decision.Reasons, "自动 approve 失败："+err.Error())
+			_ = s.auditCommand(ctx, cmdCtx, "auto_approve_failed", map[string]string{
+				"error":           err.Error(),
+				"head_sha":        pr.HeadSHA,
+				"config_snapshot": policy.SnapshotJSON(policyConfig),
+			})
+		} else {
+			decision.AutoApproved = true
+			decision.ApprovalStatus = "auto_approved"
+			_ = s.auditCommand(ctx, cmdCtx, "auto_approved", map[string]string{
+				"head_sha":        pr.HeadSHA,
+				"config_snapshot": policy.SnapshotJSON(policyConfig),
+			})
+		}
+	}
 	if err := s.store.SaveApprovalCheck(ctx, store.ApprovalCheck{
 		PullRequestID: cmdCtx.PRID,
 		ReviewRunID:   decision.ReviewRunID,
 		TriggeredBy:   cmdCtx.Actor,
 		Result:        decision.Result,
 		Reasons:       decision.Reasons,
-		AutoApproved:  false,
+		AutoApproved:  decision.AutoApproved,
 	}); err != nil {
 		_ = s.store.FinishCommentCommand(ctx, cmdCtx.CommandID, "failed", "", err.Error())
 		return err
@@ -261,13 +293,21 @@ func (s *Server) handleApproveCheckCommand(ctx context.Context, cmdCtx commandCo
 		return err
 	}
 
-	message := RenderApproveCheckComment(decision, checks, risk, hasRisk)
+	message := RenderApproveCheckComment(decision, checks, risk, hasRisk, policyConfig)
 	if err := cmdCtx.GitHub.CreateIssueComment(ctx, cmdCtx.Ref, message); err != nil {
 		_ = s.store.FinishCommentCommand(ctx, cmdCtx.CommandID, "failed", "", err.Error())
 		return err
 	}
 	_ = s.auditCommand(ctx, cmdCtx, "approval_check_completed", map[string]string{"result": decision.Result})
 	return s.store.FinishCommentCommand(ctx, cmdCtx.CommandID, "success", message, "")
+}
+
+func changedFilePaths(files []github.ChangedFile) []string {
+	paths := make([]string, 0, len(files))
+	for _, file := range files {
+		paths = append(paths, file.Filename)
+	}
+	return paths
 }
 
 func (s *Server) auditCommand(ctx context.Context, cmdCtx commandContext, action string, detail map[string]string) error {

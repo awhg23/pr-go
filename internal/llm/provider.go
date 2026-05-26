@@ -11,10 +11,19 @@ type Reviewer interface {
 	Review(context.Context, review.Input) (review.Result, error)
 }
 
+type Options struct {
+	Model       string
+	Temperature *float64
+}
+
 func NewReviewer(provider string) (Reviewer, error) {
+	return NewReviewerWithOptions(provider, Options{})
+}
+
+func NewReviewerWithOptions(provider string, options Options) (Reviewer, error) {
 	switch provider {
 	case "openai", "":
-		return NewOpenAIReviewerFromEnv(), nil
+		return NewOpenAIReviewerFromEnvWithOptions(options), nil
 	case "mock":
 		return MockReviewer{}, nil
 	default:
