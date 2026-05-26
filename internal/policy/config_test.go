@@ -93,3 +93,13 @@ func TestHumanReviewRuleReasons(t *testing.T) {
 		t.Fatalf("reasons = %#v, want two matches", reasons)
 	}
 }
+
+func TestValidateAllowsOpenAICompatibleProviders(t *testing.T) {
+	for _, provider := range []string{"openai", "openai-compatible", "deepseek", "siliconflow", "ollama", "mock"} {
+		cfg := DefaultConfig()
+		cfg.Model.Provider = provider
+		if err := validate(cfg); err != nil {
+			t.Fatalf("provider %q should be valid: %v", provider, err)
+		}
+	}
+}

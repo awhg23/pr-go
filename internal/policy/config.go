@@ -396,7 +396,7 @@ func validate(cfg Config) error {
 		return fmt.Errorf("unsupported version %d", cfg.Version)
 	}
 	switch cfg.Model.Provider {
-	case "", "default", "openai", "openai-compatible", "mock":
+	case "", "default", "openai", "openai-compatible", "deepseek", "siliconflow", "ollama", "mock":
 	default:
 		return fmt.Errorf("unsupported model.provider %q", cfg.Model.Provider)
 	}

@@ -1,0 +1,32 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: pr_go
+      MYSQL_USER: pr_go
+      MYSQL_PASSWORD: change-me
+      MYSQL_ROOT_PASSWORD: change-root
+    volumes:
+      - pr_go_mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pchange-root"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  pr-go:
+    build: .
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      MYSQL_DSN: pr_go:change-me@tcp(mysql:3306)/pr_go?parseTime=true
+    volumes:
+      - ./secrets/github-app.pem:/run/secrets/github-app.pem:ro
+
+volumes:
+  pr_go_mysql:

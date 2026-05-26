@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 
@@ -43,6 +44,10 @@ func (s *MySQLStore) EnsureSchema(ctx context.Context) error {
 	return nil
 }
 
+func (s *MySQLStore) Ping(ctx context.Context) error {
+	return s.db.PingContext(ctx)
+}
+
 func (s *MySQLStore) RecordDelivery(ctx context.Context, d Delivery) (bool, error) {
 	if d.DeliveryID == "" {
 		return false, fmt.Errorf("delivery id is required")
@@ -70,6 +75,111 @@ func (s *MySQLStore) MarkDeliveryStatus(ctx context.Context, deliveryID, status,
 UPDATE webhook_deliveries
 SET status = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP
 WHERE delivery_id = ?`, status, errorMessage, deliveryID)
+	return err
+}
+
+func (s *MySQLStore) EnqueueWebhookJob(ctx context.Context, job WebhookJob) (int64, error) {
+	if strings.TrimSpace(job.DeliveryID) == "" {
+		return 0, fmt.Errorf("delivery id is required")
+	}
+	if job.Status == "" {
+		job.Status = "queued"
+	}
+	if job.MaxAttempts <= 0 {
+		job.MaxAttempts = 3
+	}
+	res, err := s.db.ExecContext(ctx, `
+INSERT INTO webhook_jobs
+  (delivery_id, event, action, repository_full_name, payload_json, status, attempts, max_attempts, available_at, last_error)
+VALUES (?, ?, ?, ?, ?, ?, 0, ?, COALESCE(?, CURRENT_TIMESTAMP), ?)
+ON DUPLICATE KEY UPDATE
+  id = LAST_INSERT_ID(id),
+  updated_at = CURRENT_TIMESTAMP`,
+		job.DeliveryID, job.Event, job.Action, job.RepositoryFullName, job.PayloadJSON, job.Status,
+		job.MaxAttempts, nullableTime(job.AvailableAt), job.LastError)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func (s *MySQLStore) ClaimWebhookJob(ctx context.Context, id int64, workerID string) (WebhookJob, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return WebhookJob{}, false, err
+	}
+	defer tx.Rollback()
+
+	query := `
+SELECT id, delivery_id, event, action, repository_full_name, payload_json, status, attempts, max_attempts, COALESCE(last_error, ''), available_at
+FROM webhook_jobs
+WHERE (
+  (status IN ('queued', 'retrying') AND available_at <= CURRENT_TIMESTAMP)
+  OR (status = 'processing' AND locked_at < TIMESTAMPADD(MINUTE, -15, CURRENT_TIMESTAMP))
+)
+ORDER BY
+  CASE WHEN status = 'processing' THEN 0 ELSE 1 END,
+  available_at ASC,
+  id ASC
+LIMIT 1
+FOR UPDATE`
+	args := []any{}
+	if id > 0 {
+		query = `
+SELECT id, delivery_id, event, action, repository_full_name, payload_json, status, attempts, max_attempts, COALESCE(last_error, ''), available_at
+FROM webhook_jobs
+WHERE id = ? AND (
+  (status IN ('queued', 'retrying') AND available_at <= CURRENT_TIMESTAMP)
+  OR (status = 'processing' AND locked_at < TIMESTAMPADD(MINUTE, -15, CURRENT_TIMESTAMP))
+)
+FOR UPDATE`
+		args = append(args, id)
+	}
+
+	var job WebhookJob
+	err = tx.QueryRowContext(ctx, query, args...).Scan(&job.ID, &job.DeliveryID, &job.Event, &job.Action, &job.RepositoryFullName, &job.PayloadJSON, &job.Status, &job.Attempts, &job.MaxAttempts, &job.LastError, &job.AvailableAt)
+	if err == sql.ErrNoRows {
+		return WebhookJob{}, false, nil
+	}
+	if err != nil {
+		return WebhookJob{}, false, err
+	}
+	_, err = tx.ExecContext(ctx, `
+UPDATE webhook_jobs
+SET status = 'processing', attempts = attempts + 1, locked_at = CURRENT_TIMESTAMP, locked_by = ?, updated_at = CURRENT_TIMESTAMP
+WHERE id = ?`, workerID, job.ID)
+	if err != nil {
+		return WebhookJob{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return WebhookJob{}, false, err
+	}
+	job.Attempts++
+	job.Status = "processing"
+	return job, true, nil
+}
+
+func (s *MySQLStore) CompleteWebhookJob(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE webhook_jobs
+SET status = 'processed', last_error = NULL, locked_at = NULL, locked_by = '', updated_at = CURRENT_TIMESTAMP
+WHERE id = ?`, id)
+	return err
+}
+
+func (s *MySQLStore) RetryWebhookJob(ctx context.Context, id int64, errorMessage string, availableAt time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE webhook_jobs
+SET status = 'retrying', last_error = ?, available_at = ?, locked_at = NULL, locked_by = '', updated_at = CURRENT_TIMESTAMP
+WHERE id = ?`, errorMessage, availableAt, id)
+	return err
+}
+
+func (s *MySQLStore) FailWebhookJob(ctx context.Context, id int64, errorMessage string) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE webhook_jobs
+SET status = 'failed', last_error = ?, locked_at = NULL, locked_by = '', updated_at = CURRENT_TIMESTAMP
+WHERE id = ?`, errorMessage, id)
 	return err
 }
 
@@ -377,6 +487,262 @@ LIMIT ?`, repoFullName, limit)
 	return out, rows.Err()
 }
 
+func (s *MySQLStore) ListRepositorySummaries(ctx context.Context, limit int) ([]RepositorySummary, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT repo.id, gi.installation_id, repo.full_name,
+  (SELECT COUNT(*) FROM pull_requests pr WHERE pr.repository_id = repo.id AND pr.state = 'open') AS open_prs,
+  (SELECT COUNT(DISTINCT pr2.id)
+   FROM pull_requests pr2
+   JOIN risk_scores rs2 ON rs2.pull_request_id = pr2.id
+   WHERE pr2.repository_id = repo.id AND rs2.level IN ('high', 'blocker')) AS high_risk_prs,
+  COALESCE(MAX(pr.updated_at), repo.updated_at) AS last_activity
+FROM repositories repo
+JOIN github_installations gi ON gi.id = repo.installation_id
+LEFT JOIN pull_requests pr ON pr.repository_id = repo.id
+GROUP BY repo.id, gi.installation_id, repo.full_name, repo.updated_at
+ORDER BY last_activity DESC
+LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []RepositorySummary
+	for rows.Next() {
+		var item RepositorySummary
+		if err := rows.Scan(&item.ID, &item.InstallationID, &item.FullName, &item.OpenPRs, &item.HighRiskPRs, &item.LastActivity); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *MySQLStore) RepositoryReport(ctx context.Context, fullName string, limit int) (RepositoryReport, error) {
+	if strings.TrimSpace(fullName) == "" {
+		return RepositoryReport{}, fmt.Errorf("repository full name is required")
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	var repoID int64
+	if err := s.db.QueryRowContext(ctx, `SELECT id FROM repositories WHERE full_name = ?`, fullName).Scan(&repoID); err != nil {
+		return RepositoryReport{}, err
+	}
+	report := RepositoryReport{RepositoryFullName: fullName}
+
+	buckets, err := s.queryRiskBuckets(ctx, repoID)
+	if err != nil {
+		return RepositoryReport{}, err
+	}
+	report.RiskDistribution = buckets
+	prs, err := s.queryPRSummaries(ctx, repoID, limit)
+	if err != nil {
+		return RepositoryReport{}, err
+	}
+	report.PullRequests = prs
+	findings, err := s.queryFindingReports(ctx, repoID, limit)
+	if err != nil {
+		return RepositoryReport{}, err
+	}
+	report.Findings = findings
+	approvals, err := s.queryApprovalReports(ctx, repoID, limit)
+	if err != nil {
+		return RepositoryReport{}, err
+	}
+	report.ApprovalChecks = approvals
+	audits, err := s.queryAuditReports(ctx, repoID, limit)
+	if err != nil {
+		return RepositoryReport{}, err
+	}
+	report.AuditLogs = audits
+	return report, nil
+}
+
+func (s *MySQLStore) Metrics(ctx context.Context) (MetricsSnapshot, error) {
+	out := MetricsSnapshot{
+		DeliveriesByStatus:     map[string]int{},
+		JobsByStatus:           map[string]int{},
+		ReviewRunsByStatus:     map[string]int{},
+		ApprovalChecksByResult: map[string]int{},
+	}
+	var err error
+	if out.DeliveriesByStatus, err = s.countBy(ctx, "webhook_deliveries", "status"); err != nil {
+		return MetricsSnapshot{}, err
+	}
+	if out.JobsByStatus, err = s.countBy(ctx, "webhook_jobs", "status"); err != nil {
+		return MetricsSnapshot{}, err
+	}
+	if out.ReviewRunsByStatus, err = s.countBy(ctx, "review_runs", "status"); err != nil {
+		return MetricsSnapshot{}, err
+	}
+	if out.ApprovalChecksByResult, err = s.countBy(ctx, "approval_checks", "result"); err != nil {
+		return MetricsSnapshot{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM repositories`).Scan(&out.TotalRepositories); err != nil {
+		return MetricsSnapshot{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pull_requests`).Scan(&out.TotalPullRequests); err != nil {
+		return MetricsSnapshot{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM review_findings WHERE status = 'open'`).Scan(&out.TotalOpenFindings); err != nil {
+		return MetricsSnapshot{}, err
+	}
+	return out, nil
+}
+
+func (s *MySQLStore) queryRiskBuckets(ctx context.Context, repoID int64) ([]RiskBucket, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT latest.level, COUNT(*)
+FROM (
+  SELECT pr.id AS pull_request_id, rs.level
+  FROM pull_requests pr
+  JOIN risk_scores rs ON rs.pull_request_id = pr.id
+  JOIN (
+    SELECT pull_request_id, MAX(id) AS latest_id
+    FROM risk_scores
+    GROUP BY pull_request_id
+  ) latest_rs ON latest_rs.latest_id = rs.id
+  WHERE pr.repository_id = ?
+) latest
+GROUP BY latest.level`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RiskBucket
+	for rows.Next() {
+		var item RiskBucket
+		if err := rows.Scan(&item.Level, &item.Count); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *MySQLStore) queryPRSummaries(ctx context.Context, repoID int64, limit int) ([]PRSummary, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT pr.pr_number, pr.title, pr.author_login, pr.state, pr.approval_status, pr.head_sha,
+       COALESCE(rs.level, ''), COALESCE(rs.score, 0), pr.updated_at
+FROM pull_requests pr
+LEFT JOIN (
+  SELECT rs1.*
+  FROM risk_scores rs1
+  JOIN (
+    SELECT pull_request_id, MAX(id) AS latest_id
+    FROM risk_scores
+    GROUP BY pull_request_id
+  ) latest_rs ON latest_rs.latest_id = rs1.id
+) rs ON rs.pull_request_id = pr.id
+WHERE pr.repository_id = ?
+ORDER BY pr.updated_at DESC
+LIMIT ?`, repoID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PRSummary
+	for rows.Next() {
+		var item PRSummary
+		if err := rows.Scan(&item.Number, &item.Title, &item.AuthorLogin, &item.State, &item.ApprovalStatus, &item.HeadSHA, &item.RiskLevel, &item.RiskScore, &item.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *MySQLStore) queryFindingReports(ctx context.Context, repoID int64, limit int) ([]FindingReport, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT pr.pr_number, rf.finding_id, rf.severity, rf.status, rf.file_path, rf.title, rf.created_at
+FROM review_findings rf
+JOIN pull_requests pr ON pr.id = rf.pull_request_id
+WHERE pr.repository_id = ?
+ORDER BY rf.created_at DESC
+LIMIT ?`, repoID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FindingReport
+	for rows.Next() {
+		var item FindingReport
+		if err := rows.Scan(&item.PRNumber, &item.FindingID, &item.Severity, &item.Status, &item.FilePath, &item.Title, &item.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *MySQLStore) queryApprovalReports(ctx context.Context, repoID int64, limit int) ([]ApprovalReport, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT pr.pr_number, ac.result, ac.auto_approved, ac.triggered_by, ac.created_at
+FROM approval_checks ac
+JOIN pull_requests pr ON pr.id = ac.pull_request_id
+WHERE pr.repository_id = ?
+ORDER BY ac.created_at DESC
+LIMIT ?`, repoID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ApprovalReport
+	for rows.Next() {
+		var item ApprovalReport
+		if err := rows.Scan(&item.PRNumber, &item.Result, &item.AutoApproved, &item.TriggeredBy, &item.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *MySQLStore) queryAuditReports(ctx context.Context, repoID int64, limit int) ([]AuditReport, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT COALESCE(pr.pr_number, 0), al.actor, al.action, al.detail_json, al.created_at
+FROM audit_logs al
+LEFT JOIN pull_requests pr ON pr.id = al.pull_request_id
+WHERE al.repository_id = ?
+ORDER BY al.created_at DESC
+LIMIT ?`, repoID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AuditReport
+	for rows.Next() {
+		var item AuditReport
+		if err := rows.Scan(&item.PRNumber, &item.Actor, &item.Action, &item.DetailJSON, &item.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *MySQLStore) countBy(ctx context.Context, table string, column string) (map[string]int, error) {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`SELECT %s, COUNT(*) FROM %s GROUP BY %s`, column, table, column))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var key string
+		var count int
+		if err := rows.Scan(&key, &count); err != nil {
+			return nil, err
+		}
+		out[key] = count
+	}
+	return out, rows.Err()
+}
+
 func nullableLine(line int) any {
 	if line <= 0 {
 		return nil
@@ -389,4 +755,11 @@ func nullableID(id int64) any {
 		return nil
 	}
 	return id
+}
+
+func nullableTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t
 }

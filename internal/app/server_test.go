@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/awhg23/pr-go/internal/review"
 	"github.com/awhg23/pr-go/internal/store"
@@ -128,6 +129,62 @@ func TestHandleWebhookIgnoresNonCommandComment(t *testing.T) {
 	}
 }
 
+func TestAdminEndpointsRequireToken(t *testing.T) {
+	server := &Server{cfg: ServerConfig{AdminToken: "secret"}, store: &fakeStore{}, logger: discardLogger(t)}
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	rec := httptest.NewRecorder()
+
+	server.handleAdminHome(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestAdminRepositoriesAPI(t *testing.T) {
+	server := &Server{
+		cfg: ServerConfig{AdminToken: "secret"},
+		store: &fakeStore{repos: []store.RepositorySummary{{
+			FullName: "owner/repo",
+			OpenPRs:  2,
+		}}},
+		logger: discardLogger(t),
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/repositories?token=secret", nil)
+	rec := httptest.NewRecorder()
+
+	server.handleRepositoriesAPI(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "owner/repo") {
+		t.Fatalf("body missing repository: %s", rec.Body.String())
+	}
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	server := &Server{
+		cfg: ServerConfig{AdminToken: "secret"},
+		store: &fakeStore{metrics: store.MetricsSnapshot{
+			DeliveriesByStatus: map[string]int{"processed": 3},
+			JobsByStatus:       map[string]int{"queued": 1},
+		}},
+		logger: discardLogger(t),
+	}
+	req := httptest.NewRequest(http.MethodGet, "/metrics?token=secret", nil)
+	rec := httptest.NewRecorder()
+
+	server.handleMetrics(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `pr_go_webhook_deliveries{status="processed"} 3`) {
+		t.Fatalf("metrics body = %s", rec.Body.String())
+	}
+}
+
 func discardLogger(t *testing.T) *log.Logger {
 	t.Helper()
 	return log.New(io.Discard, "", 0)
@@ -136,14 +193,29 @@ func discardLogger(t *testing.T) *log.Logger {
 type fakeStore struct {
 	inserted bool
 	recorded store.Delivery
+	repos    []store.RepositorySummary
+	report   store.RepositoryReport
+	metrics  store.MetricsSnapshot
 }
 
 func (f *fakeStore) EnsureSchema(context.Context) error { return nil }
+func (f *fakeStore) Ping(context.Context) error         { return nil }
 func (f *fakeStore) RecordDelivery(_ context.Context, d store.Delivery) (bool, error) {
 	f.recorded = d
 	return f.inserted, nil
 }
 func (f *fakeStore) MarkDeliveryStatus(context.Context, string, string, string) error { return nil }
+func (f *fakeStore) EnqueueWebhookJob(context.Context, store.WebhookJob) (int64, error) {
+	return 1, nil
+}
+func (f *fakeStore) ClaimWebhookJob(context.Context, int64, string) (store.WebhookJob, bool, error) {
+	return store.WebhookJob{}, false, nil
+}
+func (f *fakeStore) CompleteWebhookJob(context.Context, int64) error { return nil }
+func (f *fakeStore) RetryWebhookJob(context.Context, int64, string, time.Time) error {
+	return nil
+}
+func (f *fakeStore) FailWebhookJob(context.Context, int64, string) error { return nil }
 func (f *fakeStore) UpsertInstallation(context.Context, store.Installation) (int64, error) {
 	return 0, nil
 }
@@ -202,5 +274,14 @@ func (f *fakeStore) SaveApprovalCheck(context.Context, store.ApprovalCheck) erro
 func (f *fakeStore) Audit(context.Context, store.AuditLog) error { return nil }
 func (f *fakeStore) RecentHighRiskPRs(context.Context, string, int) ([]store.HighRiskPR, error) {
 	return nil, nil
+}
+func (f *fakeStore) ListRepositorySummaries(context.Context, int) ([]store.RepositorySummary, error) {
+	return f.repos, nil
+}
+func (f *fakeStore) RepositoryReport(context.Context, string, int) (store.RepositoryReport, error) {
+	return f.report, nil
+}
+func (f *fakeStore) Metrics(context.Context) (store.MetricsSnapshot, error) {
+	return f.metrics, nil
 }
 func (f *fakeStore) Close() error { return nil }

@@ -75,6 +75,24 @@ func TestParseWebhookCommand(t *testing.T) {
 	}
 }
 
+func TestParseWebhookInstallationRepositoriesTrigger(t *testing.T) {
+	body := []byte(`{"action":"added","installation":{"id":99},"repositories_added":[{"full_name":"owner/repo","name":"repo"}]}`)
+	headers := http.Header{}
+	headers.Set("X-Hub-Signature-256", signature("secret", body))
+	headers.Set("X-GitHub-Event", EventInstallationRepositories)
+
+	event, err := ParseWebhook(headers, body, "secret")
+	if err != nil {
+		t.Fatalf("ParseWebhook returned error: %v", err)
+	}
+	if !event.ShouldTriggerInstallation() {
+		t.Fatal("expected installation_repositories.added to trigger installation handling")
+	}
+	if len(event.RepositoriesAdded) != 1 || event.RepositoriesAdded[0].FullName != "owner/repo" {
+		t.Fatalf("repositories_added = %+v", event.RepositoriesAdded)
+	}
+}
+
 func signature(secret string, body []byte) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)

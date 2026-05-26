@@ -22,7 +22,7 @@ func NewReviewer(provider string) (Reviewer, error) {
 
 func NewReviewerWithOptions(provider string, options Options) (Reviewer, error) {
 	switch provider {
-	case "openai", "":
+	case "openai", "openai-compatible", "deepseek", "siliconflow", "ollama", "":
 		return NewOpenAIReviewerFromEnvWithOptions(options), nil
 	case "mock":
 		return MockReviewer{}, nil

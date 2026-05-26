@@ -9,8 +9,14 @@ import (
 
 type Store interface {
 	EnsureSchema(context.Context) error
+	Ping(context.Context) error
 	RecordDelivery(context.Context, Delivery) (bool, error)
 	MarkDeliveryStatus(context.Context, string, string, string) error
+	EnqueueWebhookJob(context.Context, WebhookJob) (int64, error)
+	ClaimWebhookJob(context.Context, int64, string) (WebhookJob, bool, error)
+	CompleteWebhookJob(context.Context, int64) error
+	RetryWebhookJob(context.Context, int64, string, time.Time) error
+	FailWebhookJob(context.Context, int64, string) error
 	UpsertInstallation(context.Context, Installation) (int64, error)
 	UpsertRepository(context.Context, Repository) (int64, error)
 	UpsertPullRequest(context.Context, PullRequest) (int64, error)
@@ -32,6 +38,9 @@ type Store interface {
 	SaveApprovalCheck(context.Context, ApprovalCheck) error
 	Audit(context.Context, AuditLog) error
 	RecentHighRiskPRs(context.Context, string, int) ([]HighRiskPR, error)
+	ListRepositorySummaries(context.Context, int) ([]RepositorySummary, error)
+	RepositoryReport(context.Context, string, int) (RepositoryReport, error)
+	Metrics(context.Context) (MetricsSnapshot, error)
 	Close() error
 }
 
@@ -42,6 +51,20 @@ type Delivery struct {
 	RepositoryFullName string
 	Status             string
 	ErrorMessage       string
+}
+
+type WebhookJob struct {
+	ID                 int64
+	DeliveryID         string
+	Event              string
+	Action             string
+	RepositoryFullName string
+	PayloadJSON        string
+	Status             string
+	Attempts           int
+	MaxAttempts        int
+	LastError          string
+	AvailableAt        time.Time
 }
 
 type Installation struct {
@@ -141,4 +164,75 @@ type HighRiskPR struct {
 	Score              int
 	Level              string
 	CreatedAt          time.Time
+}
+
+type RepositorySummary struct {
+	ID             int64
+	InstallationID int64
+	FullName       string
+	OpenPRs        int
+	HighRiskPRs    int
+	LastActivity   time.Time
+}
+
+type RiskBucket struct {
+	Level string
+	Count int
+}
+
+type PRSummary struct {
+	Number         int
+	Title          string
+	AuthorLogin    string
+	State          string
+	ApprovalStatus string
+	HeadSHA        string
+	RiskLevel      string
+	RiskScore      int
+	UpdatedAt      time.Time
+}
+
+type FindingReport struct {
+	PRNumber  int
+	FindingID string
+	Severity  string
+	Status    string
+	FilePath  string
+	Title     string
+	CreatedAt time.Time
+}
+
+type ApprovalReport struct {
+	PRNumber     int
+	Result       string
+	AutoApproved bool
+	TriggeredBy  string
+	CreatedAt    time.Time
+}
+
+type AuditReport struct {
+	PRNumber   int
+	Actor      string
+	Action     string
+	DetailJSON string
+	CreatedAt  time.Time
+}
+
+type RepositoryReport struct {
+	RepositoryFullName string
+	RiskDistribution   []RiskBucket
+	PullRequests       []PRSummary
+	Findings           []FindingReport
+	ApprovalChecks     []ApprovalReport
+	AuditLogs          []AuditReport
+}
+
+type MetricsSnapshot struct {
+	DeliveriesByStatus     map[string]int
+	JobsByStatus           map[string]int
+	ReviewRunsByStatus     map[string]int
+	ApprovalChecksByResult map[string]int
+	TotalRepositories      int
+	TotalPullRequests      int
+	TotalOpenFindings      int
 }

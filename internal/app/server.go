@@ -29,6 +29,9 @@ type ServerConfig struct {
 	WorkerCount   int
 	MaxRetries    int
 	RetryDelay    time.Duration
+	QueuePoll     time.Duration
+	AdminToken    string
+	AlertWebhook  string
 }
 
 type Server struct {
@@ -41,8 +44,7 @@ type Server struct {
 }
 
 type reviewJob struct {
-	Event   WebhookEvent
-	Attempt int
+	ID int64
 }
 
 func NewServer(cfg ServerConfig, logger *log.Logger) (*Server, error) {
@@ -72,6 +74,9 @@ func NewServer(cfg ServerConfig, logger *log.Logger) (*Server, error) {
 	}
 	if cfg.RetryDelay == 0 {
 		cfg.RetryDelay = 2 * time.Second
+	}
+	if cfg.QueuePoll == 0 {
+		cfg.QueuePoll = 2 * time.Second
 	}
 	if logger == nil {
 		logger = log.Default()
@@ -121,6 +126,12 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
+	mux.HandleFunc("/readyz", s.handleReadyz)
+	mux.HandleFunc("/metrics", s.handleMetrics)
+	mux.HandleFunc("/admin", s.handleAdminHome)
+	mux.HandleFunc("/admin/repo", s.handleAdminRepo)
+	mux.HandleFunc("/api/v1/repositories", s.handleRepositoriesAPI)
+	mux.HandleFunc("/api/v1/repository", s.handleRepositoryAPI)
 	return mux
 }
 
@@ -155,7 +166,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !event.ShouldTriggerReview() && !event.ShouldTriggerCommand() {
+	if !event.ShouldTriggerReview() && !event.ShouldTriggerCommand() && !event.ShouldTriggerInstallation() {
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte("ignored\n"))
 		return
@@ -178,56 +189,116 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("duplicate\n"))
 		return
 	}
+	payloadJSON, err := json.Marshal(event)
+	if err != nil {
+		_ = s.store.MarkDeliveryStatus(r.Context(), event.DeliveryID, "failed", err.Error())
+		http.Error(w, "encode webhook job failed", http.StatusInternalServerError)
+		return
+	}
+	jobID, err := s.store.EnqueueWebhookJob(r.Context(), store.WebhookJob{
+		DeliveryID:         event.DeliveryID,
+		Event:              event.Event,
+		Action:             event.Action,
+		RepositoryFullName: event.Repository.FullName,
+		PayloadJSON:        string(payloadJSON),
+		Status:             "queued",
+		MaxAttempts:        s.cfg.MaxRetries,
+	})
+	if err != nil {
+		_ = s.store.MarkDeliveryStatus(r.Context(), event.DeliveryID, "failed", err.Error())
+		http.Error(w, "enqueue webhook job failed", http.StatusInternalServerError)
+		s.logger.Printf("enqueue webhook job failed delivery=%s: %v", event.DeliveryID, err)
+		return
+	}
 
 	select {
-	case s.jobs <- reviewJob{Event: event, Attempt: 1}:
-		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte("queued\n"))
+	case s.jobs <- reviewJob{ID: jobID}:
 	default:
-		err := fmt.Errorf("review queue is full")
-		_ = s.store.MarkDeliveryStatus(r.Context(), event.DeliveryID, "failed", err.Error())
-		http.Error(w, "review queue full", http.StatusServiceUnavailable)
+		s.logger.Printf("worker signal queue is full; persisted job will be picked up by poller job_id=%d delivery=%s", jobID, event.DeliveryID)
 	}
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte("queued\n"))
 }
 
 func (s *Server) startWorkers() {
 	for i := 0; i < s.cfg.WorkerCount; i++ {
+		workerID := fmt.Sprintf("worker-%d", i+1)
 		go func() {
 			for job := range s.jobs {
-				s.processJob(job)
+				s.processJob(job, workerID)
+			}
+		}()
+		go func() {
+			ticker := time.NewTicker(s.cfg.QueuePoll)
+			defer ticker.Stop()
+			for range ticker.C {
+				s.drainJobs(workerID)
 			}
 		}()
 	}
 }
 
-func (s *Server) processJob(job reviewJob) {
+func (s *Server) drainJobs(workerID string) {
+	for {
+		if ok := s.processJob(reviewJob{}, workerID); !ok {
+			return
+		}
+	}
+}
+
+func (s *Server) processJob(job reviewJob, workerID string) bool {
 	ctx := context.Background()
-	_ = s.store.MarkDeliveryStatus(ctx, job.Event.DeliveryID, "processing", "")
-	var err error
-	switch {
-	case job.Event.ShouldTriggerReview():
-		err = s.reviewPullRequest(ctx, job.Event, "", "")
-	case job.Event.ShouldTriggerCommand():
-		err = s.handleCommand(ctx, job.Event)
-	default:
-		err = nil
+	claimed, ok, err := s.store.ClaimWebhookJob(ctx, job.ID, workerID)
+	if err != nil {
+		s.logger.Printf("claim webhook job failed id=%d: %v", job.ID, err)
+		return false
+	}
+	if !ok {
+		return false
+	}
+	var event WebhookEvent
+	err = json.Unmarshal([]byte(claimed.PayloadJSON), &event)
+	if err == nil {
+		_ = s.store.MarkDeliveryStatus(ctx, event.DeliveryID, "processing", "")
+		err = s.processEvent(ctx, event)
 	}
 	if err == nil {
-		_ = s.store.MarkDeliveryStatus(ctx, job.Event.DeliveryID, "processed", "")
-		return
+		_ = s.store.MarkDeliveryStatus(ctx, claimed.DeliveryID, "processed", "")
+		_ = s.store.CompleteWebhookJob(ctx, claimed.ID)
+		return true
 	}
 
-	s.logger.Printf("review failed delivery=%s repo=%s action=%s attempt=%d: %v",
-		job.Event.DeliveryID, job.Event.Repository.FullName, job.Event.Action, job.Attempt, err)
-	if job.Attempt < s.cfg.MaxRetries {
-		_ = s.store.MarkDeliveryStatus(ctx, job.Event.DeliveryID, "retrying", err.Error())
-		next := reviewJob{Event: job.Event, Attempt: job.Attempt + 1}
-		time.AfterFunc(s.retryDelay(job.Attempt), func() {
-			s.jobs <- next
-		})
-		return
+	s.logger.Printf("webhook job failed delivery=%s repo=%s action=%s attempt=%d/%d: %v",
+		claimed.DeliveryID, claimed.RepositoryFullName, claimed.Action, claimed.Attempts, claimed.MaxAttempts, err)
+	if claimed.Attempts < claimed.MaxAttempts {
+		_ = s.store.MarkDeliveryStatus(ctx, claimed.DeliveryID, "retrying", err.Error())
+		_ = s.store.RetryWebhookJob(ctx, claimed.ID, err.Error(), time.Now().Add(s.retryDelay(claimed.Attempts)))
+		return true
 	}
-	_ = s.store.MarkDeliveryStatus(ctx, job.Event.DeliveryID, "failed", err.Error())
+	_ = s.store.MarkDeliveryStatus(ctx, claimed.DeliveryID, "failed", err.Error())
+	_ = s.store.FailWebhookJob(ctx, claimed.ID, err.Error())
+	s.sendAlert(ctx, "webhook_job_failed", map[string]any{
+		"delivery_id": claimed.DeliveryID,
+		"event":       claimed.Event,
+		"action":      claimed.Action,
+		"repository":  claimed.RepositoryFullName,
+		"attempts":    claimed.Attempts,
+		"error":       err.Error(),
+	})
+	return true
+}
+
+func (s *Server) processEvent(ctx context.Context, event WebhookEvent) error {
+	switch {
+	case event.ShouldTriggerReview():
+		return s.reviewPullRequest(ctx, event, "", "")
+	case event.ShouldTriggerCommand():
+		return s.handleCommand(ctx, event)
+	case event.ShouldTriggerInstallation():
+		return s.handleInstallationEvent(ctx, event)
+	default:
+		return nil
+	}
 }
 
 func (s *Server) retryDelay(attempt int) time.Duration {

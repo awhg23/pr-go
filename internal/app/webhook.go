@@ -12,21 +12,26 @@ import (
 )
 
 const (
-	EventPullRequest  = "pull_request"
-	EventIssueComment = "issue_comment"
+	EventPullRequest              = "pull_request"
+	EventIssueComment             = "issue_comment"
+	EventInstallation             = "installation"
+	EventInstallationRepositories = "installation_repositories"
 )
 
 type WebhookEvent struct {
-	Event        string
-	Action       string
-	DeliveryID   string
-	Repository   Repository
-	Installation Installation
-	PullRequest  *PullRequest
-	Issue        *Issue
-	Comment      *Comment
-	Sender       Sender
-	RawPayload   []byte
+	Event               string
+	Action              string
+	DeliveryID          string
+	Repository          Repository
+	Installation        Installation
+	PullRequest         *PullRequest
+	Issue               *Issue
+	Comment             *Comment
+	Repositories        []Repository
+	RepositoriesAdded   []Repository
+	RepositoriesRemoved []Repository
+	Sender              Sender
+	RawPayload          []byte
 }
 
 type Repository struct {
@@ -97,29 +102,35 @@ func ParseWebhook(headers http.Header, body []byte, secret string) (WebhookEvent
 	}
 
 	var payload struct {
-		Action       string       `json:"action"`
-		Repository   Repository   `json:"repository"`
-		Installation Installation `json:"installation"`
-		PullRequest  *PullRequest `json:"pull_request"`
-		Issue        *Issue       `json:"issue"`
-		Comment      *Comment     `json:"comment"`
-		Sender       Sender       `json:"sender"`
+		Action              string       `json:"action"`
+		Repository          Repository   `json:"repository"`
+		Installation        Installation `json:"installation"`
+		PullRequest         *PullRequest `json:"pull_request"`
+		Issue               *Issue       `json:"issue"`
+		Comment             *Comment     `json:"comment"`
+		Repositories        []Repository `json:"repositories"`
+		RepositoriesAdded   []Repository `json:"repositories_added"`
+		RepositoriesRemoved []Repository `json:"repositories_removed"`
+		Sender              Sender       `json:"sender"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return WebhookEvent{}, fmt.Errorf("parse webhook payload: %w", err)
 	}
 
 	return WebhookEvent{
-		Event:        headers.Get("X-GitHub-Event"),
-		Action:       payload.Action,
-		DeliveryID:   headers.Get("X-GitHub-Delivery"),
-		Repository:   payload.Repository,
-		Installation: payload.Installation,
-		PullRequest:  payload.PullRequest,
-		Issue:        payload.Issue,
-		Comment:      payload.Comment,
-		Sender:       payload.Sender,
-		RawPayload:   append([]byte(nil), body...),
+		Event:               headers.Get("X-GitHub-Event"),
+		Action:              payload.Action,
+		DeliveryID:          headers.Get("X-GitHub-Delivery"),
+		Repository:          payload.Repository,
+		Installation:        payload.Installation,
+		PullRequest:         payload.PullRequest,
+		Issue:               payload.Issue,
+		Comment:             payload.Comment,
+		Repositories:        payload.Repositories,
+		RepositoriesAdded:   payload.RepositoriesAdded,
+		RepositoriesRemoved: payload.RepositoriesRemoved,
+		Sender:              payload.Sender,
+		RawPayload:          append([]byte(nil), body...),
 	}, nil
 }
 
@@ -147,6 +158,17 @@ func (e WebhookEvent) Command() string {
 
 func (e WebhookEvent) ShouldTriggerCommand() bool {
 	return e.Event == EventIssueComment && e.Action == "created" && e.Command() != ""
+}
+
+func (e WebhookEvent) ShouldTriggerInstallation() bool {
+	switch e.Event {
+	case EventInstallation:
+		return e.Action == "created" || e.Action == "deleted"
+	case EventInstallationRepositories:
+		return e.Action == "added" || e.Action == "removed"
+	default:
+		return false
+	}
 }
 
 func (e WebhookEvent) CommandArgs() string {

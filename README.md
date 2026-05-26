@@ -1,6 +1,6 @@
 # pr-go
 
-`pr-go` is a Go prototype for a PR approval agent. V0 validates the local CLI review pipeline, V1 adds a GitHub App webhook MVP, and V2 adds MySQL-backed review history, audit logs, delivery deduplication, async processing, and retries.
+`pr-go` is a production-oriented Go GitHub App for AI-assisted PR review and approval governance. It reviews pull requests, stores review/audit history in MySQL, supports maintainer comment commands, reads repository approval policy, can auto-approve only when explicitly enabled, and exposes an admin dashboard plus operational metrics.
 
 ## V0 Scope
 
@@ -38,6 +38,56 @@ Smoke verification without an LLM key can use the mock reviewer. It still fetche
 ```bash
 go run ./cmd/pr-go --provider mock --output json --pr-url https://github.com/owner/repo/pull/123
 ```
+
+## Production Deployment
+
+Use `DEPLOYMENT.md` for the full production checklist. The minimum server environment is:
+
+```bash
+GITHUB_APP_ID=123456
+GITHUB_APP_PRIVATE_KEY_FILE=/run/secrets/github-app.pem
+GITHUB_WEBHOOK_SECRET=change-me
+MYSQL_DSN='user:pass@tcp(mysql:3306)/pr_go?parseTime=true'
+OPENAI_API_KEY=sk-xxx
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4.1-mini
+PR_GO_ADMIN_TOKEN='long-random-admin-token'
+```
+
+Run:
+
+```bash
+go run ./cmd/pr-go --server --addr :8080
+```
+
+Production endpoints:
+
+```text
+POST /webhook
+GET  /healthz
+GET  /readyz
+GET  /metrics?token=<admin-token>
+GET  /admin?token=<admin-token>
+GET  /admin/repo?full_name=owner/repo&token=<admin-token>
+GET  /api/v1/repositories
+GET  /api/v1/repository?full_name=owner/repo
+```
+
+GitHub App permissions:
+
+- Repository contents: read
+- Pull requests: read/write
+- Issues: read/write
+- Checks: read
+- Commit statuses: read
+- Metadata: read
+
+Webhook events:
+
+- Pull request
+- Issue comment
+- Installation
+- Installation repositories
 
 ## Development
 
@@ -118,12 +168,17 @@ Stored data includes:
 
 Webhook requests are acknowledged after signature validation, delivery deduplication, and enqueueing. Review execution happens in background workers controlled by `--worker-count`; failed jobs retry with exponential backoff up to `--max-retries`.
 
+V5 persists webhook work in MySQL `webhook_jobs`; workers claim due jobs from MySQL and poll for queued/retrying jobs, so process restarts do not lose accepted webhook work.
+
 Useful server flags:
 
 ```text
 --mysql-dsn       MySQL DSN for V2 persistence
 --worker-count    number of async review workers
 --max-retries     maximum async review attempts
+--queue-poll      persistent queue poll interval
+--admin-token     admin dashboard/API bearer token
+--alert-webhook   optional alert webhook URL for final job failures
 ```
 
 Query recent high-risk PRs:
@@ -217,3 +272,18 @@ model:
 ```
 
 `/ai-approve-check` applies required checks, human-review rules, and changed-test requirements. It only calls GitHub's approve API when the result is `建议审批` and `approval.auto_approve.enabled` is explicitly `true`.
+
+## V5 Operations
+
+V5 is the final usable app shape:
+
+- MySQL-backed persistent webhook jobs with retry and restart recovery.
+- Processing jobs locked for more than 15 minutes can be reclaimed by workers after a crash.
+- Multi-repository installation tracking.
+- Admin dashboard for repositories, PR risk distribution, findings, approval checks, and audit logs.
+- JSON report APIs for integrations.
+- Prometheus-style metrics for deliveries, jobs, review runs, approval checks, repositories, PRs, and open findings.
+- `/readyz` verifies MySQL connectivity.
+- Optional final-failure alert webhook via `PR_GO_ALERT_WEBHOOK_URL`.
+- Admin dashboard, APIs, and metrics require `PR_GO_ADMIN_TOKEN`.
+- OpenAI-compatible providers include `openai`, `openai-compatible`, `deepseek`, `siliconflow`, `ollama`, and `mock`.

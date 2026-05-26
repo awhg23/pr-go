@@ -27,6 +27,9 @@ type config struct {
 	MySQLDSN      string
 	WorkerCount   int
 	MaxRetries    int
+	QueuePoll     time.Duration
+	AdminToken    string
+	AlertWebhook  string
 	Provider      string
 	Output        string
 	MaxDiffBytes  int
@@ -109,6 +112,9 @@ func runServer(cfg config) error {
 		Timeout:       cfg.Timeout,
 		WorkerCount:   cfg.WorkerCount,
 		MaxRetries:    cfg.MaxRetries,
+		QueuePoll:     cfg.QueuePoll,
+		AdminToken:    cfg.AdminToken,
+		AlertWebhook:  cfg.AlertWebhook,
 	}, nil)
 	if err != nil {
 		return err
@@ -128,7 +134,10 @@ func parseFlags() config {
 	flag.StringVar(&cfg.MySQLDSN, "mysql-dsn", os.Getenv("MYSQL_DSN"), "MySQL DSN for V2 persistence")
 	flag.IntVar(&cfg.WorkerCount, "worker-count", envIntDefault("PR_GO_WORKER_COUNT", 2), "number of async review workers")
 	flag.IntVar(&cfg.MaxRetries, "max-retries", envIntDefault("PR_GO_MAX_RETRIES", 3), "maximum async review attempts")
-	flag.StringVar(&cfg.Provider, "provider", envDefault("PR_GO_PROVIDER", "openai"), "review provider: openai or mock")
+	flag.DurationVar(&cfg.QueuePoll, "queue-poll", envDurationDefault("PR_GO_QUEUE_POLL", 2*time.Second), "persistent queue poll interval")
+	flag.StringVar(&cfg.AdminToken, "admin-token", os.Getenv("PR_GO_ADMIN_TOKEN"), "admin dashboard/API bearer token")
+	flag.StringVar(&cfg.AlertWebhook, "alert-webhook", os.Getenv("PR_GO_ALERT_WEBHOOK_URL"), "optional alert webhook URL for final job failures")
+	flag.StringVar(&cfg.Provider, "provider", envDefault("PR_GO_PROVIDER", "openai"), "review provider: openai-compatible, openai, deepseek, siliconflow, ollama, or mock")
 	flag.StringVar(&cfg.Output, "output", "markdown", "output format: markdown or json")
 	flag.IntVar(&cfg.MaxDiffBytes, "max-diff-bytes", 60000, "maximum diff bytes sent to the reviewer")
 	flag.DurationVar(&cfg.Timeout, "timeout", 90*time.Second, "overall command timeout")
@@ -155,6 +164,15 @@ func envInt64Default(name string, fallback int64) int64 {
 func envIntDefault(name string, fallback int) int {
 	if v := os.Getenv(name); v != "" {
 		if parsed, err := strconv.Atoi(v); err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
+func envDurationDefault(name string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(name); v != "" {
+		if parsed, err := time.ParseDuration(v); err == nil {
 			return parsed
 		}
 	}
