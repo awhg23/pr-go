@@ -18,6 +18,9 @@ func TestSchemaStatementsContainV2Tables(t *testing.T) {
 		"model_invocations",
 		"review_comments",
 		"audit_logs",
+		"comment_commands",
+		"approval_checks",
+		"dismissed_by",
 	} {
 		if !strings.Contains(joined, table) {
 			t.Fatalf("schema missing table %s", table)

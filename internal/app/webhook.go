@@ -144,3 +144,25 @@ func (e WebhookEvent) Command() string {
 	}
 	return fields[0]
 }
+
+func (e WebhookEvent) ShouldTriggerCommand() bool {
+	return e.Event == EventIssueComment && e.Action == "created" && e.Command() != ""
+}
+
+func (e WebhookEvent) CommandArgs() string {
+	if e.Command() == "" || e.Comment == nil {
+		return ""
+	}
+	fields := strings.Fields(strings.TrimSpace(e.Comment.Body))
+	if len(fields) <= 1 {
+		return ""
+	}
+	return strings.Join(fields[1:], " ")
+}
+
+func (e WebhookEvent) Actor() string {
+	if e.Comment != nil && e.Comment.User.Login != "" {
+		return e.Comment.User.Login
+	}
+	return e.Sender.Login
+}

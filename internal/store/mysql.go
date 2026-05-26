@@ -127,6 +127,21 @@ ON DUPLICATE KEY UPDATE
 	return res.LastInsertId()
 }
 
+func (s *MySQLStore) EnsurePullRequest(ctx context.Context, repositoryID int64, number int) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `
+INSERT INTO pull_requests
+  (repository_id, pr_number, title, state, approval_status)
+VALUES (?, ?, '', 'open', 'review_pending')
+ON DUPLICATE KEY UPDATE
+  id = LAST_INSERT_ID(id),
+  updated_at = CURRENT_TIMESTAMP`,
+		repositoryID, number)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
 func (s *MySQLStore) UpdatePullRequestApprovalStatus(ctx context.Context, prID int64, status string) error {
 	_, err := s.db.ExecContext(ctx, `
 UPDATE pull_requests
@@ -148,6 +163,14 @@ VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
 		return 0, err
 	}
 	return res.LastInsertId()
+}
+
+func (s *MySQLStore) UpdateReviewRunHeadSHA(ctx context.Context, runID int64, headSHA string) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE review_runs
+SET head_sha = ?
+WHERE id = ?`, headSHA, runID)
+	return err
 }
 
 func (s *MySQLStore) FinishReviewRun(ctx context.Context, runID int64, status, errorMessage string) error {
@@ -200,6 +223,122 @@ func (s *MySQLStore) SaveReviewComment(ctx context.Context, runID, prID int64, s
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO review_comments (review_run_id, pull_request_id, status, error_message)
 VALUES (?, ?, ?, ?)`, runID, prID, status, errorMessage)
+	return err
+}
+
+func (s *MySQLStore) CreateCommentCommand(ctx context.Context, command CommentCommand) (int64, error) {
+	if command.Status == "" {
+		command.Status = "running"
+	}
+	res, err := s.db.ExecContext(ctx, `
+INSERT INTO comment_commands
+  (pull_request_id, command, args, actor, status, result_message, error_message, delivery_id)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		command.PullRequestID, command.Command, command.Args, command.Actor, command.Status,
+		command.ResultMessage, command.ErrorMessage, command.DeliveryID)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func (s *MySQLStore) FinishCommentCommand(ctx context.Context, id int64, status, resultMessage, errorMessage string) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE comment_commands
+SET status = ?, result_message = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP
+WHERE id = ?`, status, resultMessage, errorMessage, id)
+	return err
+}
+
+func (s *MySQLStore) LatestRiskScore(ctx context.Context, prID int64) (RiskSnapshot, bool, error) {
+	var row RiskSnapshot
+	var reasonsJSON string
+	err := s.db.QueryRowContext(ctx, `
+SELECT review_run_id, pull_request_id, score, level, reasons_json, created_at
+FROM risk_scores
+WHERE pull_request_id = ?
+ORDER BY created_at DESC, id DESC
+LIMIT 1`, prID).Scan(&row.ReviewRunID, &row.PullRequestID, &row.Score, &row.Level, &reasonsJSON, &row.CreatedAt)
+	if err == sql.ErrNoRows {
+		return RiskSnapshot{}, false, nil
+	}
+	if err != nil {
+		return RiskSnapshot{}, false, err
+	}
+	if reasonsJSON != "" {
+		_ = json.Unmarshal([]byte(reasonsJSON), &row.Reasons)
+	}
+	return row, true, nil
+}
+
+func (s *MySQLStore) LatestSuccessfulReviewRun(ctx context.Context, prID int64) (ReviewRunSnapshot, bool, error) {
+	var row ReviewRunSnapshot
+	var finished sql.NullTime
+	err := s.db.QueryRowContext(ctx, `
+SELECT id, pull_request_id, head_sha, status, finished_at
+FROM review_runs
+WHERE pull_request_id = ? AND status = 'success'
+ORDER BY COALESCE(finished_at, started_at) DESC, id DESC
+LIMIT 1`, prID).Scan(&row.ID, &row.PullRequestID, &row.HeadSHA, &row.Status, &finished)
+	if err == sql.ErrNoRows {
+		return ReviewRunSnapshot{}, false, nil
+	}
+	if err != nil {
+		return ReviewRunSnapshot{}, false, err
+	}
+	if finished.Valid {
+		row.FinishedAt = finished.Time
+	}
+	return row, true, nil
+}
+
+func (s *MySQLStore) ListOpenFindings(ctx context.Context, prID int64) ([]FindingSnapshot, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, finding_id, file_path, COALESCE(line_number, 0), severity, category, title, reason, suggestion
+FROM review_findings
+WHERE pull_request_id = ? AND status = 'open'
+ORDER BY created_at DESC, id DESC`, prID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []FindingSnapshot
+	for rows.Next() {
+		var item FindingSnapshot
+		if err := rows.Scan(&item.ID, &item.FindingID, &item.FilePath, &item.LineNumber, &item.Severity, &item.Category, &item.Title, &item.Reason, &item.Suggestion); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *MySQLStore) DismissFinding(ctx context.Context, prID int64, findingID, actor, reason string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+UPDATE review_findings
+SET status = 'dismissed', dismissed_by = ?, dismissed_reason = ?
+WHERE pull_request_id = ? AND finding_id = ? AND status = 'open'`, actor, reason, prID, findingID)
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+func (s *MySQLStore) SaveApprovalCheck(ctx context.Context, check ApprovalCheck) error {
+	reasons, err := json.Marshal(check.Reasons)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO approval_checks
+  (pull_request_id, review_run_id, triggered_by, result, reasons_json, auto_approved)
+VALUES (?, ?, ?, ?, ?, ?)`,
+		check.PullRequestID, nullableID(check.ReviewRunID), check.TriggeredBy, check.Result, string(reasons), check.AutoApproved)
 	return err
 }
 

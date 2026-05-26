@@ -138,3 +138,25 @@ WHERE repo.full_name = 'owner/repo'
 ORDER BY rs.created_at DESC
 LIMIT 20;
 ```
+
+## V3 PR Comment Commands
+
+V3 adds maintainer-only PR comment commands. The app checks the comment actor through GitHub collaborator permissions; only `write`, `maintain`, and `admin` can execute commands.
+
+Supported commands:
+
+- `/ai-review`: run a new review on the current PR.
+- `/ai-recheck`: re-read the latest diff and CI/checks, then run a new review.
+- `/ai-risk`: show the latest persisted risk score and reasons.
+- `/ai-dismiss <finding-id> <reason>`: mark an open finding as dismissed with an audit reason.
+- `/ai-approve-check`: re-read the latest PR head and CI/checks, then output `建议审批`, `需要人工重点审查`, or `暂不建议审批`.
+
+`/ai-approve-check` uses conservative rules:
+
+- The latest successful review run must match the current PR head sha.
+- CI/checks must be `success`.
+- Any open high/blocker finding yields `暂不建议审批`.
+- Any open medium finding or medium risk level yields `需要人工重点审查`.
+- Only when the current head is reviewed, CI/checks pass, and no open high/blocker finding remains does it output `建议审批`.
+
+V3 still does not call GitHub approve or merge APIs.

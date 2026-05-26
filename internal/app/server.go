@@ -155,7 +155,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !event.ShouldTriggerReview() {
+	if !event.ShouldTriggerReview() && !event.ShouldTriggerCommand() {
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte("ignored\n"))
 		return
@@ -203,7 +203,15 @@ func (s *Server) startWorkers() {
 func (s *Server) processJob(job reviewJob) {
 	ctx := context.Background()
 	_ = s.store.MarkDeliveryStatus(ctx, job.Event.DeliveryID, "processing", "")
-	err := s.reviewPullRequest(ctx, job.Event)
+	var err error
+	switch {
+	case job.Event.ShouldTriggerReview():
+		err = s.reviewPullRequest(ctx, job.Event, "", "")
+	case job.Event.ShouldTriggerCommand():
+		err = s.handleCommand(ctx, job.Event)
+	default:
+		err = nil
+	}
 	if err == nil {
 		_ = s.store.MarkDeliveryStatus(ctx, job.Event.DeliveryID, "processed", "")
 		return
@@ -233,7 +241,7 @@ func (s *Server) retryDelay(attempt int) time.Duration {
 	return delay
 }
 
-func (s *Server) reviewPullRequest(ctx context.Context, event WebhookEvent) error {
+func (s *Server) reviewPullRequest(ctx context.Context, event WebhookEvent, triggerType string, actor string) error {
 	if event.Installation.ID == 0 {
 		return fmt.Errorf("webhook missing installation id")
 	}
@@ -247,6 +255,12 @@ func (s *Server) reviewPullRequest(ctx context.Context, event WebhookEvent) erro
 
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
 	defer cancel()
+	if triggerType == "" {
+		triggerType = event.Event + "." + event.Action
+	}
+	if actor == "" {
+		actor = event.Actor()
+	}
 
 	installationDBID, err := s.store.UpsertInstallation(ctx, store.Installation{
 		InstallationID: event.Installation.ID,
@@ -277,8 +291,8 @@ func (s *Server) reviewPullRequest(ctx context.Context, event WebhookEvent) erro
 	}
 	runID, err := s.store.CreateReviewRun(ctx, store.ReviewRun{
 		PullRequestID: prID,
-		TriggerType:   event.Event + "." + event.Action,
-		TriggerActor:  event.Sender.Login,
+		TriggerType:   triggerType,
+		TriggerActor:  actor,
 		HeadSHA:       event.PullRequest.Head.SHA,
 		Status:        "running",
 	})
@@ -288,14 +302,14 @@ func (s *Server) reviewPullRequest(ctx context.Context, event WebhookEvent) erro
 
 	token, err := s.auth.InstallationToken(ctx, event.Installation.ID)
 	if err != nil {
-		return s.handleJobError(ctx, repoID, prID, runID, event.Sender.Login, "github_app_token_failed", fmt.Errorf("create installation token: %w", err))
+		return s.handleJobError(ctx, repoID, prID, runID, actor, "github_app_token_failed", fmt.Errorf("create installation token: %w", err))
 	}
 	gh := github.NewClient(token)
 	ref := github.PullRequestRef{Owner: owner, Repo: repo, Number: event.PullRequest.Number}
 
 	pr, err := gh.FetchPullRequest(ctx, ref)
 	if err != nil {
-		return s.handleJobError(ctx, repoID, prID, runID, event.Sender.Login, "github_fetch_pr_failed", err)
+		return s.handleJobError(ctx, repoID, prID, runID, actor, "github_fetch_pr_failed", err)
 	}
 	prID, err = s.store.UpsertPullRequest(ctx, store.PullRequest{
 		RepositoryID:   repoID,
@@ -308,7 +322,10 @@ func (s *Server) reviewPullRequest(ctx context.Context, event WebhookEvent) erro
 		ApprovalStatus: "reviewing",
 	})
 	if err != nil {
-		return s.handleJobError(ctx, repoID, prID, runID, event.Sender.Login, "mysql_write_failed", fmt.Errorf("record pull request: %w", err))
+		return s.handleJobError(ctx, repoID, prID, runID, actor, "mysql_write_failed", fmt.Errorf("record pull request: %w", err))
+	}
+	if err := s.store.UpdateReviewRunHeadSHA(ctx, runID, pr.HeadSHA); err != nil {
+		return s.handleJobError(ctx, repoID, prID, runID, actor, "mysql_write_failed", fmt.Errorf("record review run head sha: %w", err))
 	}
 	checks, err := gh.FetchChecksSummary(ctx, ref, pr.HeadSHA)
 	if err != nil {
@@ -318,7 +335,7 @@ func (s *Server) reviewPullRequest(ctx context.Context, event WebhookEvent) erro
 		_ = s.store.Audit(ctx, store.AuditLog{
 			RepositoryID:  repoID,
 			PullRequestID: prID,
-			Actor:         event.Sender.Login,
+			Actor:         actor,
 			Action:        "github_checks_unavailable",
 			DetailJSON:    string(detail),
 		})
@@ -333,28 +350,28 @@ func (s *Server) reviewPullRequest(ctx context.Context, event WebhookEvent) erro
 			Status:       "failed",
 			ErrorMessage: err.Error(),
 		})
-		return s.handleJobError(ctx, repoID, prID, runID, event.Sender.Login, "llm_review_failed", fmt.Errorf("review with provider: %w", err))
+		return s.handleJobError(ctx, repoID, prID, runID, actor, "llm_review_failed", fmt.Errorf("review with provider: %w", err))
 	}
 	review.EnsureSchema(&result)
 	result.Risk = review.ScoreRisk(input, result.Findings)
 
 	if err := s.store.SaveModelInvocation(ctx, runID, result.ModelInvocation); err != nil {
-		return s.handleJobError(ctx, repoID, prID, runID, event.Sender.Login, "mysql_write_failed", fmt.Errorf("record model invocation: %w", err))
+		return s.handleJobError(ctx, repoID, prID, runID, actor, "mysql_write_failed", fmt.Errorf("record model invocation: %w", err))
 	}
 	if err := s.store.SaveFindings(ctx, runID, prID, result.Findings); err != nil {
-		return s.handleJobError(ctx, repoID, prID, runID, event.Sender.Login, "mysql_write_failed", fmt.Errorf("record findings: %w", err))
+		return s.handleJobError(ctx, repoID, prID, runID, actor, "mysql_write_failed", fmt.Errorf("record findings: %w", err))
 	}
 	if err := s.store.SaveRiskScore(ctx, runID, prID, result.Risk); err != nil {
-		return s.handleJobError(ctx, repoID, prID, runID, event.Sender.Login, "mysql_write_failed", fmt.Errorf("record risk score: %w", err))
+		return s.handleJobError(ctx, repoID, prID, runID, actor, "mysql_write_failed", fmt.Errorf("record risk score: %w", err))
 	}
 
 	comment := review.RenderGitHubComment(input, result, checks)
 	if err := gh.CreateIssueComment(ctx, ref, comment); err != nil {
 		_ = s.store.SaveReviewComment(ctx, runID, prID, "failed", err.Error())
-		return s.handleJobError(ctx, repoID, prID, runID, event.Sender.Login, "github_comment_failed", fmt.Errorf("publish PR comment: %w", err))
+		return s.handleJobError(ctx, repoID, prID, runID, actor, "github_comment_failed", fmt.Errorf("publish PR comment: %w", err))
 	}
 	if err := s.store.SaveReviewComment(ctx, runID, prID, "published", ""); err != nil {
-		return s.handleJobError(ctx, repoID, prID, runID, event.Sender.Login, "mysql_write_failed", fmt.Errorf("record review comment: %w", err))
+		return s.handleJobError(ctx, repoID, prID, runID, actor, "mysql_write_failed", fmt.Errorf("record review comment: %w", err))
 	}
 	detail, _ := json.Marshal(map[string]any{
 		"risk_level": result.Risk.Level,
@@ -364,11 +381,11 @@ func (s *Server) reviewPullRequest(ctx context.Context, event WebhookEvent) erro
 	if err := s.store.Audit(ctx, store.AuditLog{
 		RepositoryID:  repoID,
 		PullRequestID: prID,
-		Actor:         event.Sender.Login,
+		Actor:         actor,
 		Action:        "review_completed",
 		DetailJSON:    string(detail),
 	}); err != nil {
-		return s.handleJobError(ctx, repoID, prID, runID, event.Sender.Login, "mysql_write_failed", fmt.Errorf("record audit log: %w", err))
+		return s.handleJobError(ctx, repoID, prID, runID, actor, "mysql_write_failed", fmt.Errorf("record audit log: %w", err))
 	}
 	if err := s.store.FinishReviewRun(ctx, runID, "success", ""); err != nil {
 		return fmt.Errorf("finish review run: %w", err)

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +33,10 @@ type PullRequest struct {
 type ChecksSummary struct {
 	State   string
 	Details []string
+}
+
+type CollaboratorPermission struct {
+	Permission string `json:"permission"`
 }
 
 type ChangedFile struct {
@@ -130,6 +135,18 @@ func (c *Client) CreateIssueComment(ctx context.Context, ref PullRequestRef, bod
 	path := fmt.Sprintf("/repos/%s/%s/issues/%d/comments", ref.Owner, ref.Repo, ref.Number)
 	payload := map[string]string{"body": body}
 	return c.postJSON(ctx, path, payload, nil)
+}
+
+func (c *Client) FetchCollaboratorPermission(ctx context.Context, ref PullRequestRef, username string) (string, error) {
+	if strings.TrimSpace(username) == "" {
+		return "", fmt.Errorf("username is required")
+	}
+	var payload CollaboratorPermission
+	path := fmt.Sprintf("/repos/%s/%s/collaborators/%s/permission", ref.Owner, ref.Repo, url.PathEscape(username))
+	if err := c.getJSON(ctx, path, &payload); err != nil {
+		return "", err
+	}
+	return payload.Permission, nil
 }
 
 func (c *Client) fetchFiles(ctx context.Context, ref PullRequestRef) ([]ChangedFile, error) {
